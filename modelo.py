@@ -1,208 +1,238 @@
 import pandas as pd
 import numpy as np
-from sklearn.model_selection import train_test_split
 from sklearn.ensemble import RandomForestRegressor
-from sklearn.linear_model import LinearRegression
-from xgboost import XGBRegressor
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 from sklearn.preprocessing import LabelEncoder
-import joblib
+import pickle
 import os
+import re
+from data_loader import obtener_dataset_ml
+
+try:
+    import xgboost as xgb
+    XGBOOST_DISPONIBLE = True
+except ImportError:
+    XGBOOST_DISPONIBLE = False
+    print("️ XGBoost no está instalado. Ejecuta: pip install xgboost")
+
 
 class ModeloPredictor:
     def __init__(self):
-        self.modelos = {
-            'random_forest': RandomForestRegressor(n_estimators=100, random_state=42),
-            'xgboost': XGBRegressor(n_estimators=100, learning_rate=0.1, random_state=42),
-            'regresion_lineal': LinearRegression()
-        }
-        self.modelo_entrenado = None
-        self.nombre_modelo = None
-        self.label_encoder_temporada = LabelEncoder()
-        self.metricas = {}
-        self.columnas_x = []
-        
-    def preparar_datos(self, df):
-        """Prepara los datos para el entrenamiento"""
-        df = df.copy()
-        
-        # Eliminar filas con valores nulos en ocupación
-        df = df.dropna(subset=['ocupacion_porcentaje'])
-        
-        # Llenar valores nulos con la media
-        columnas_numericas = ['temperatura', 'humedad', 'precipitacion', 
-                             'total_dias', 'checkin_nacionales', 
-                             'checkin_extranjeros', 'tarifa_cobrada']
-        
-        for col in columnas_numericas:
-            if col in df.columns:
-                df[col] = df[col].fillna(df[col].mean())
-        
-        # Codificar variable categórica 'temporada'
-        if 'temporada' in df.columns:
-            df['temporada'] = df['temporada'].fillna('Media')
-            df['temporada_cod'] = self.label_encoder_temporada.fit_transform(df['temporada'])
-        else:
-            df['temporada_cod'] = 0
-        
-        # Extraer características de fecha
-        df['fecha'] = pd.to_datetime(df['fecha'])
-        df['mes'] = df['fecha'].dt.month
-        df['dia_semana'] = df['fecha'].dt.dayofweek
-        df['es_fin_semana'] = df['dia_semana'].isin([5, 6]).astype(int)
-        
-        # Variables predictoras
-        columnas_x = ['checkin_nacionales', 'checkin_extranjeros', 
-                     'tarifa_cobrada', 'temperatura', 'humedad', 
-                     'precipitacion', 'total_dias', 'temporada_cod',
-                     'mes', 'dia_semana', 'es_fin_semana']
-        
-        columnas_x = [c for c in columnas_x if c in df.columns]
-        
-        X = df[columnas_x]
-        y = df['ocupacion_porcentaje']
-        
-        return X, y, columnas_x
-    
-    def calcular_precision(self, valores_reales, valores_predichos):
-        """Calcula la precisión según la fórmula de tu tesis"""
-        precisiones = []
-        for real, pred in zip(valores_reales, valores_predichos):
+        self.modelos = {}  # Diccionario para guardar ambos modelos
+        self.metricas = {}  # Métricas comparativas
+        self.nombre_modelo = "Random Forest"  # Modelo por defecto
+        self.modelo_entrenado = False
+        self.archivo_modelo_rf = "modelo_rf_ots.pkl"
+        self.archivo_modelo_xgb = "modelo_xgb_ots.pkl"
+
+    def preprocesar(self, df):
+        """Limpia y prepara los datos para el modelo"""
+        if df.empty:
+            return None
+
+        data = df.copy()
+
+        # 1. Manejo de fechas
+        if 'fecha' in data.columns:
+            data['fecha'] = pd.to_datetime(data['fecha'], errors='coerce')
+            data['mes'] = data['fecha'].dt.month
+            data['dia_semana'] = data['fecha'].dt.dayofweek
+            data['es_fin_semana'] = data['dia_semana'].apply(lambda x: 1 if x >= 5 else 0)
+            data.drop(columns=['fecha'], inplace=True)
+
+        # 2. Codificar variables categóricas
+        le = LabelEncoder()
+        if 'temporada' in data.columns:
+            data['temporada_cod'] = le.fit_transform(data['temporada'].fillna('Media').astype(str))
+            data.drop(columns=['temporada'], inplace=True)
+
+        # 3. Eliminar columnas no útiles
+        columnas_a_eliminar = ['id_hotel', 'fecha_registro', 'cedula_encuestador', 'id', 'id_feriado', 'id_clima', 'id_ocupacion']
+        data.drop(columns=[c for c in columnas_a_eliminar if c in data.columns], inplace=True, errors='ignore')
+
+        # 4. Rellenar nulos con 0
+        data.fillna(0, inplace=True)
+
+        return data
+
+    def calcular_metricas(self, y_test, y_pred):
+        """Calcula las métricas de evaluación"""
+        rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+        mae = mean_absolute_error(y_test, y_pred)
+        r2 = r2_score(y_test, y_pred)
+
+        # Fórmula de precisión personalizada de la Tesis
+        errores_relativos = []
+        for real, pred in zip(y_test, y_pred):
             if real != 0:
-                precision = (1 - abs(real - pred) / real) * 100
-                precisiones.append(max(0, precision))
+                error = abs(real - pred) / abs(real)
+                errores_relativos.append(error)
             else:
-                precisiones.append(0)
-        
-        return np.mean(precisiones) if precisiones else 0
-    
-    def entrenar(self, df):
-        """Entrena todos los modelos y selecciona el mejor"""
-        X, y, columnas_x = self.preparar_datos(df)
-        
-        # Dividir datos
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3, random_state=42)
-        X_val, X_test, y_val, y_test = train_test_split(X_test, test_size=0.5, random_state=42)
-        
-        print(f"\nDatos divididos:")
-        print(f"   Entrenamiento: {len(X_train)} registros")
-        print(f"   Validación: {len(X_val)} registros")
-        print(f"   Prueba: {len(X_test)} registros")
-        
-        resultados = {}
-        
-        for nombre, modelo in self.modelos.items():
-            print(f"\nEntrenando {nombre}...")
-            
-            modelo.fit(X_train, y_train)
-            
-            y_test_pred = modelo.predict(X_test)
-            
-            mae = mean_absolute_error(y_test, y_test_pred)
-            rmse = np.sqrt(mean_squared_error(y_test, y_test_pred))
-            r2 = r2_score(y_test, y_test_pred)
-            precision = self.calcular_precision(y_test.values, y_test_pred)
-            
-            resultados[nombre] = {
-                'modelo': modelo,
-                'mae': mae,
-                'rmse': rmse,
-                'r2': r2,
-                'precision': precision
-            }
-            
-            print(f"   MAE: {mae:.2f}")
-            print(f"   RMSE: {rmse:.2f}")
-            print(f"   R²: {r2:.4f}")
-            print(f"   Precisión: {precision:.2f}%")
-        
-        # Seleccionar el mejor modelo
-        mejor_nombre = max(resultados, key=lambda k: resultados[k]['precision'])
-        self.modelo_entrenado = resultados[mejor_nombre]['modelo']
-        self.nombre_modelo = mejor_nombre
-        self.metricas = {
-            'mae': resultados[mejor_nombre]['mae'],
-            'rmse': resultados[mejor_nombre]['rmse'],
-            'r2': resultados[mejor_nombre]['r2'],
-            'precision': resultados[mejor_nombre]['precision']
-        }
-        self.columnas_x = columnas_x
-        
-        print(f"\nMejor modelo: {mejor_nombre}")
-        print(f"   Precisión: {self.metricas['precision']:.2f}%")
-        
-        self.guardar_modelo()
-        
+                if pred != 0:
+                    errores_relativos.append(1.0)
+
+        precision = (1 - np.mean(errores_relativos)) * 100 if errores_relativos else 0
+        precision = max(0, min(100, precision))
+
         return {
-            'mejor_modelo': mejor_nombre,
-            'metricas': self.metricas,
-            'todos_modelos': {k: {
-                'mae': v['mae'],
-                'rmse': v['rmse'],
-                'r2': v['r2'],
-                'precision': v['precision']
-            } for k, v in resultados.items()}
+            'rmse': round(float(rmse), 2),
+            'mae': round(float(mae), 2),
+            'r2': round(float(r2), 4),
+            'precision': round(float(precision), 2)
         }
-    
-    def predecir(self, datos_entrada):
-        """Realiza una predicción"""
-        if self.modelo_entrenado is None:
-            raise ValueError("No hay modelo entrenado")
-        
-        if isinstance(datos_entrada, dict):
-            df = pd.DataFrame([datos_entrada])
+
+    def entrenar(self, df):
+        """Entrena AMBOS algoritmos y los compara"""
+        data = self.preprocesar(df)
+
+        if data is None or len(data) < 10:
+            raise ValueError("No hay suficientes datos para entrenar")
+
+        # Variable objetivo
+        target = 'ocupacion_porcentaje'
+        if target not in data.columns:
+            if 'ocupacion' in data.columns:
+                target = 'ocupacion'
+            else:
+                raise ValueError(f"Columna objetivo '{target}' no encontrada")
+
+        X = data.drop(columns=[target])
+        y = data[target]
+
+        # División 70/30
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3, random_state=42)
+
+        resultados = {}
+
+        # ==========================================
+        # MODELO 1: RANDOM FOREST
+        # ==========================================
+        print("\n Entrenando Random Forest...")
+        rf_model = RandomForestRegressor(n_estimators=100, random_state=42, max_depth=10)
+        rf_model.fit(X_train, y_train)
+        rf_pred = rf_model.predict(X_test)
+        rf_metricas = self.calcular_metricas(y_test, rf_pred)
+
+        # Guardar modelo RF
+        with open(self.archivo_modelo_rf, 'wb') as f:
+            pickle.dump(rf_model, f)
+
+        resultados['Random Forest'] = rf_metricas
+        print(f"    RMSE: {rf_metricas['rmse']}, Precisión: {rf_metricas['precision']}%")
+
+        # ==========================================
+        # MODELO 2: XGBOOST
+        # ==========================================
+        if XGBOOST_DISPONIBLE:
+            print("\n Entrenando XGBoost...")
+            xgb_model = xgb.XGBRegressor(
+                n_estimators=100,
+                max_depth=6,
+                learning_rate=0.1,
+                random_state=42,
+                objective='reg:squarederror'
+            )
+            xgb_model.fit(X_train, y_train)
+            xgb_pred = xgb_model.predict(X_test)
+            xgb_metricas = self.calcular_metricas(y_test, xgb_pred)
+
+            # Guardar modelo XGB
+            with open(self.archivo_modelo_xgb, 'wb') as f:
+                pickle.dump(xgb_model, f)
+
+            resultados['XGBoost'] = xgb_metricas
+            print(f"    RMSE: {xgb_metricas['rmse']}, Precisión: {xgb_metricas['precision']}%")
         else:
-            df = datos_entrada
-        
-        if 'temporada' in df.columns:
-            df['temporada_cod'] = self.label_encoder_temporada.transform(df['temporada'])
-        else:
-            df['temporada_cod'] = 0
-        
-        if 'fecha' in df.columns:
-            df['fecha'] = pd.to_datetime(df['fecha'])
-            df['mes'] = df['fecha'].dt.month
-            df['dia_semana'] = df['fecha'].dt.dayofweek
-            df['es_fin_semana'] = df['dia_semana'].isin([5, 6]).astype(int)
-        
-        columnas = [c for c in self.columnas_x if c in df.columns]
-        X = df[columnas]
-        
-        prediccion = self.modelo_entrenado.predict(X)
-        
-        return prediccion[0]
-    
-    def guardar_modelo(self):
-        """Guarda el modelo entrenado"""
-        carpeta = 'modelos_guardados'
-        if not os.path.exists(carpeta):
-            os.makedirs(carpeta)
-        
-        data = {
-            'modelo': self.modelo_entrenado,
-            'nombre_modelo': self.nombre_modelo,
-            'metricas': self.metricas,
-            'label_encoder': self.label_encoder_temporada,
-            'columnas_x': self.columnas_x
+            resultados['XGBoost'] = {
+                'rmse': 0, 'mae': 0, 'r2': 0, 'precision': 0,
+                'error': 'XGBoost no instalado'
+            }
+
+        # ==========================================
+        # COMPARACIÓN Y SELECCIÓN DEL MEJOR
+        # ==========================================
+        mejor_modelo = 'Random Forest'
+        if XGBOOST_DISPONIBLE:
+            if resultados['XGBoost']['precision'] > resultados['Random Forest']['precision']:
+                mejor_modelo = 'XGBoost'
+
+        self.modelos = {
+            'Random Forest': rf_model,
+            'XGBoost': xgb_model if XGBOOST_DISPONIBLE else None
         }
+        self.metricas = resultados
+        self.nombre_modelo = mejor_modelo
+        self.modelo_entrenado = True
+
+        return {
+            'mejor_modelo': mejor_modelo,
+            'metricas': resultados,
+            'comparacion': self.generar_comparacion()
+        }
+
+    def generar_comparacion(self):
+        """Genera un resumen comparativo"""
+        rf = self.metricas.get('Random Forest', {})
+        xgb = self.metricas.get('XGBoost', {})
+
+        ganador = 'Random Forest'
+        if XGBOOST_DISPONIBLE and xgb.get('precision', 0) > rf.get('precision', 0):
+            ganador = 'XGBoost'
+
+        return {
+            'ganador': ganador,
+            'random_forest': rf,
+            'xgboost': xgb,
+            'diferencia_precision': abs(rf.get('precision', 0) - xgb.get('precision', 0))
+        }
+
+    def predecir(self, datos_input):
+        """Genera predicción usando el mejor modelo, manejando columnas faltantes"""
+        if not self.modelo_entrenado:
+            self.cargar_modelo()
+
+        # 1. ESTIMAR VALORES FALTANTES (Para que no falle si el usuario no los pone)
+        if 'pernoctaciones' not in datos_input or datos_input.get('pernoctaciones') is None:
+            # Estimación: (Nacionales + Extranjeros) * 2.5 días promedio de estadía
+            datos_input['pernoctaciones'] = int((datos_input.get('checkin_nacionales', 0) + datos_input.get('checkin_extranjeros', 0)) * 2.5)
+
+        if 'habitaciones_ocupadas' not in datos_input or datos_input.get('habitaciones_ocupadas') is None:
+            # Estimación: Pernoctaciones / 2 (asumiendo 2 personas por habitación)
+            datos_input['habitaciones_ocupadas'] = int(datos_input['pernoctaciones']/2)
+
+
+        df_input = pd.DataFrame([datos_input])
+        df_input = self.preprocesar(df_input)
+
+        modelo = self.modelos.get(self.nombre_modelo)
+        if modelo is None:
+            raise ValueError("No hay modelo disponible para predecir")
+
+        if hasattr(modelo, 'feature_names_in_'):
+            expected_features = modelo.feature_names_in_
+
+            for col in expected_features:
+                if col not in df_input.columns:
+                    df_input[col] = 0
+
+            df_input = df_input[expected_features]
         
-        ruta = os.path.join(carpeta, 'modelo_ots.pkl')
-        joblib.dump(data, ruta)
-        print(f"Modelo guardado en: {ruta}")
-    
+
+        prediccion = modelo.predict(df_input)[0]
+        return max(0, min(100, prediccion))
+
     def cargar_modelo(self):
-        """Carga un modelo previamente entrenado"""
-        ruta = 'modelos_guardados/modelo_ots.pkl'
-        
-        if not os.path.exists(ruta):
-            return False
-        
-        data = joblib.load(ruta)
-        self.modelo_entrenado = data['modelo']
-        self.nombre_modelo = data['nombre_modelo']
-        self.metricas = data['metricas']
-        self.label_encoder_temporada = data['label_encoder']
-        self.columnas_x = data['columnas_x']
-        
-        print(f"Modelo cargado: {self.nombre_modelo}")
-        return True
+        """Carga el mejor modelo entrenado"""
+        if os.path.exists(self.archivo_modelo_rf):
+            with open(self.archivo_modelo_rf, 'rb') as f:
+                self.modelos['Random Forest'] = pickle.load(f)
+
+        if os.path.exists(self.archivo_modelo_xgb):
+            with open(self.archivo_modelo_xgb, 'rb') as f:
+                self.modelos['XGBoost'] = pickle.load(f)
+
+        if self.modelos:
+            self.modelo_entrenado = True
+            return True
+        return False
