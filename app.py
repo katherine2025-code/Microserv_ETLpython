@@ -9,6 +9,7 @@ import io
 import pymysql
 import os
 from dotenv import load_dotenv
+import re
 
 from data_loader import obtener_dataset_ml
 from modelo import ModeloPredictor
@@ -222,10 +223,10 @@ def procesar_feriados(df):
 
 def procesar_encuestas(df):
     """
-    PROCESO ETL GENÉRICO - Detecta y procesa CUALQUIER formato de CSV
-    Sin importar cómo vengan las columnas, extrae lo máximo posible
+    PROCESO ETL GENÉRICO - Detecta y procesa CUALQUIER formato de CSV de encuestas
+    (100% compatible con la estructura actual de la BD sin cedula_encuestador)
     """
-    print("\n INICIANDO PROCESO ETL GENÉRICO...")
+    print("\n INICIANDO PROCESO ETL GENÉRICO PARA ENCUESTAS...")
     print(f" DataFrame: {len(df)} filas x {len(df.columns)} columnas")
     
     connection = get_db_connection()
@@ -239,71 +240,33 @@ def procesar_encuestas(df):
         # ==========================================
         print("\n Fase 1: Analizando estructura del CSV...")
         
-        # Convertir todo a string y limpiar
-        df = df.applymap(lambda x: str(x).strip() if pd.notna(x) else '')
+        mapeo_inteligente = {
+            'fecha_encuesta': ['start', 'fecha', 'fecha_encuesta', 'date', 'timestamp', 'end', 'submission_time', 'detalles_de_cuenta', 'submission'],
+            'genero': ['genero', 'sexo', 'gender', 'mujer', 'hombre'],
+            'edad': ['edad', 'age', 'años', 'years'],
+            'pais_residencia': ['pais', 'country', 'nacionalidad', 'residencia', 'pais_residencia']
+        }
         
-        # Detectar columna de FECHA buscando patrones
-        fecha_col = None
-        for col in df.columns:
-            col_str = str(col).lower()
-            # Buscar en nombre de columna
-            if any(x in col_str for x in ['start', 'fecha', 'date', 'time', 'submission']):
-                fecha_col = col
-                break
-            # Buscar en valores (fechas tipo "3/5/2026" o "2026-05-03")
-            if not fecha_col:
-                try:
-                    sample = df[col].dropna().head(10)
-                    if any('/' in str(v) or '-' in str(v) for v in sample):
-                        fecha_col = col
-                        break
-                except:
-                    pass
-        
-        print(f" Columna de fecha detectada: {fecha_col}")
-        
-        # Detectar columna de EDAD/GÉNERO/PAÍS buscando patrones
-        edad_col = None
-        genero_col = None
-        pais_col = None
-        
+        columnas_detectadas = {}
         for col in df.columns:
             col_lower = str(col).lower()
-            
-            # Edad
-            if any(x in col_lower for x in ['edad', 'age', 'años', 'years']):
-                edad_col = col
-            # Género
-            elif any(x in col_lower for x in ['genero', 'sexo', 'gender', 'mujer', 'hombre']):
-                genero_col = col
-            # País
-            elif any(x in col_lower for x in ['pais', 'country', 'nacionalidad', 'residencia']):
-                pais_col = col
-        
-        print(f"👤 Columnas detectadas - Edad: {edad_col}, Género: {genero_col}, País: {pais_col}")
+            for campo, posibles_nombres in mapeo_inteligente.items():
+                if any(nombre in col_lower for nombre in posibles_nombres):
+                    if campo not in columnas_detectadas:
+                        columnas_detectadas[campo] = col
+                        print(f" Detectada columna '{campo}': {col}")
+                        break
         
         # ==========================================
         # FASE 2: EXTRACCIÓN INTELIGENTE DE DATOS
         # ==========================================
-        print("\n️ Fase 2: Extrayendo datos...")
+        print("\n Fase 2: Extrayendo datos...")
         
         def extraer_fecha(valor):
-            """Extrae fecha de cualquier formato"""
             if not valor or pd.isna(valor) or str(valor) in ['nan', '', 'None']:
                 return None
-            
             valor_str = str(valor).strip()
-            
-            # Intentar múltiples formatos
-            formatos = [
-                '%d/%m/%Y %H:%M',
-                '%d/%m/%Y',
-                '%m/%d/%Y',
-                '%Y-%m-%d %H:%M:%S',
-                '%Y-%m-%d',
-                '%Y/%m/%d'
-            ]
-            
+            formatos = ['%d/%m/%Y %H:%M', '%d/%m/%Y', '%m/%d/%Y', '%Y-%m-%d %H:%M:%S', '%Y-%m-%d', '%Y/%m/%d']
             for fmt in formatos:
                 try:
                     fecha_dt = datetime.strptime(valor_str, fmt)
@@ -311,69 +274,50 @@ def procesar_encuestas(df):
                         return fecha_dt.strftime('%Y-%m-%d')
                 except:
                     continue
-            
-            # Último intento con pandas
             try:
                 fecha_dt = pd.to_datetime(valor_str, dayfirst=False)
                 if 2020 <= fecha_dt.year <= 2030:
                     return fecha_dt.strftime('%Y-%m-%d')
             except:
                 pass
-            
             return None
 
         def extraer_genero(valor):
-            """Extrae género de cualquier texto"""
             if not valor or pd.isna(valor):
                 return None
-            
             valor_str = str(valor).lower()
-            
             if any(x in valor_str for x in ['mujer', 'femenino', 'female']):
                 return 'Femenino'
             elif any(x in valor_str for x in ['hombre', 'masculino', 'male']):
                 return 'Masculino'
-            
             return None
 
         def extraer_edad(valor):
-            """Extrae edad numérica o la infiere de rangos"""
             if not valor or pd.isna(valor):
                 return None
-            
             valor_str = str(valor).lower()
-            
-            # Buscar número directo
-            import re
             numeros = re.findall(r'\b(\d{1,3})\b', valor_str)
             if numeros:
                 edad = int(numeros[0])
                 if 5 <= edad <= 120:
                     return edad
-            
-            # Buscar rangos como "18 a 24 años"
             match = re.search(r'(\d+)\s*a\s*(\d+)', valor_str)
             if match:
                 edad_min = int(match.group(1))
                 edad_max = int(match.group(2))
                 if 5 <= edad_min <= 120 and 5 <= edad_max <= 120:
                     return (edad_min + edad_max) // 2
-            
             return None
 
         def extraer_pais(valor):
-            """Extrae país de texto"""
             if not valor or pd.isna(valor):
-                return 'Ecuador'  # Default
-            
+                return 'Ecuador'
             valor_str = str(valor).strip()
             if len(valor_str) > 2 and valor_str.lower() not in ['nan', 'none', '']:
                 return valor_str[:100]
-            
             return 'Ecuador'
 
         def extraer_satisfaccion(row):
-            """Busca satisfacción en cualquier columna"""
             for col in df.columns:
                 valor = str(row.get(col, '')).lower()
                 if 'satisfaccion' in col.lower() or 'satisfecho' in valor:
@@ -387,7 +331,7 @@ def procesar_encuestas(df):
                         return 2
                     elif 'muy insatisfecho' in valor or '1' in valor:
                         return 1
-            return 3  # Default neutro
+            return 3
         
         # ==========================================
         # FASE 3: PROCESAR FILAS
@@ -399,49 +343,45 @@ def procesar_encuestas(df):
                 fila_num = int(idx) + 1
                 
                 # Extraer fecha
+                fecha_col = columnas_detectadas.get('fecha_encuesta')
                 fecha_raw = row.get(fecha_col) if fecha_col else None
                 fecha_encuesta = extraer_fecha(fecha_raw)
-                
                 if not fecha_encuesta:
-                    # Si no hay fecha, usar fecha actual
                     fecha_encuesta = datetime.now().strftime('%Y-%m-%d')
                 
                 # Extraer género
+                genero_col = columnas_detectadas.get('genero')
                 genero_raw = row.get(genero_col) if genero_col else None
                 genero = extraer_genero(genero_raw)
-                
                 if not genero:
-                    # Si no hay género, intentar buscar en todo el row
                     for col in df.columns:
                         genero = extraer_genero(row.get(col))
                         if genero:
                             break
-                
                 if not genero:
                     genero = 'No especificado'
                 
                 # Extraer edad
+                edad_col = columnas_detectadas.get('edad')
                 edad_raw = row.get(edad_col) if edad_col else None
                 edad = extraer_edad(edad_raw)
-                
                 if not edad:
-                    # Si no hay edad, intentar buscar en todo el row
                     for col in df.columns:
                         edad = extraer_edad(row.get(col))
                         if edad:
                             break
-                
                 if not edad:
-                    edad = 0  # Default
+                    edad = 0
                 
                 # Extraer país
+                pais_col = columnas_detectadas.get('pais_residencia')
                 pais_raw = row.get(pais_col) if pais_col else None
                 pais = extraer_pais(pais_raw)
                 
                 # Extraer satisfacción
                 satisfaccion = extraer_satisfaccion(row)
                 
-                # INSERTAR
+                # ✅ INSERTAR (SIN CÉDULA, COINCIDE EXACTAMENTE CON TU BD ACTUAL)
                 sql = """
                 INSERT INTO encuestas_turisticas 
                 (fecha_encuesta, genero, edad, pais_residencia, 
@@ -456,12 +396,12 @@ def procesar_encuestas(df):
                     genero,
                     edad,
                     pais,
-                    '',  # ciudad
-                    '',  # motivo
-                    0,   # noches
-                    0.0, # gasto
+                    '',  # ciudad_residencia
+                    '',  # motivo_visita
+                    0,   # noches_estadia
+                    0.0, # gasto_total
                     satisfaccion,
-                    satisfaccion  # probabilidad retorno
+                    satisfaccion # probabilidad_retorno
                 )
                 
                 cursor.execute(sql, values)
@@ -500,7 +440,6 @@ def procesar_encuestas(df):
         connection.close()
     
     return {'insertados': insertados, 'errores': errores, 'detalles': detalles}
-
 # ==========================================
 # ENDPOINTS EXISTENTES (ML)
 # ==========================================
@@ -523,28 +462,53 @@ def raiz():
 @app.post("/entrenar")
 def entrenar_modelo():
     try:
-        print("\n Iniciando entrenamiento del modelo...")
+        print("\n Iniciando entrenamiento comparativo (RF vs XGBoost)...")
         df = obtener_dataset_ml()
+
+        if df is None or len(df) == 0:
+            raise HTTPException(status_code=400, detail="No hay datos disponibles. Carga primero datos mediante el ETL.")
+
         if len(df) < 30:
-            raise HTTPException(status_code=400, detail=f"Se necesitan al menos 30 registros históricos. Solo hay {len(df)}. Carga más datos mediante el ETL.")
-        
+            raise HTTPException(status_code=400, detail=f"Se necesitan al menos 30 registros. Solo hay {len(df)}.")
+
+        if 'ocupacion_porcentaje' not in df.columns:
+            if 'ocupacion' in df.columns:
+                df.rename(columns={'ocupacion': 'ocupacion_porcentaje'}, inplace=True)
+            else:
+                raise HTTPException(status_code=400, detail="No se encontró la columna 'ocupacion_porcentaje'.")
+
+        # ✅ Entrena ambos modelos y devuelve comparación
         resultados = modelo.entrenar(df)
-        
+
         return {
-            "mensaje": "Modelo entrenado exitosamente",
+            "mensaje": "Entrenamiento comparativo completado exitosamente",
             "mejor_modelo": resultados['mejor_modelo'],
-            "metricas": resultados['metricas']
+            "metricas": resultados['metricas'],
+            "comparacion": resultados['comparacion']
         }
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f" ERROR: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
 
 @app.post("/predecir")
 def predecir_ocupacion(request: PrediccionRequest):
     try:
-        if modelo.modelo_entrenado is None:
-            if not modelo.cargar_modelo():
-                raise HTTPException(status_code=400, detail="No hay modelo entrenado. Primero ejecuta /entrenar")
+        print("\n INICIANDO PREDICCIÓN...")
+        print(f"Datos recibidos: {request}")
         
+        # Verificar si hay modelo entrenado
+        if modelo.modelo_entrenado is None:
+            print("⚠️ No hay modelo en memoria, intentando cargar desde archivo...")
+            if not modelo.cargar_modelo():
+                print("❌ ERROR: No se pudo cargar el modelo")
+                raise HTTPException(status_code=400, detail="No hay modelo entrenado. Primero ejecuta /entrenar")
+            print("✅ Modelo cargado exitosamente")
+        
+        # Preparar datos para predicción
         datos = {
             'fecha': request.fecha_objetivo,
             'checkin_nacionales': request.checkin_nacionales or 50,
@@ -553,13 +517,19 @@ def predecir_ocupacion(request: PrediccionRequest):
             'temperatura': request.temperatura or 26,
             'humedad': request.humedad or 70,
             'precipitacion': request.precipitacion or 0,
-            'total_dias': request.total_dias,
-            'temporada': request.temporada
+            'total_dias': request.total_dias or 3,
+            'temporada': request.temporada or "Media"
         }
         
+        print(f"📊 Datos para predicción: {datos}")
+        
+        # Generar predicción
         prediccion = modelo.predecir(datos)
-        prediccion = max(0, min(100, prediccion))
+        prediccion = max(0, min(100, prediccion))  # Asegurar que esté entre 0-100
+        
         error_estimado = modelo.metricas.get('rmse', 5)
+        
+        print(f"✅ Predicción generada: {prediccion}%")
         
         return {
             "fecha_objetivo": request.fecha_objetivo,
@@ -573,16 +543,107 @@ def predecir_ocupacion(request: PrediccionRequest):
             },
             "mensaje": "Predicción de Ocupación Hotelera generada exitosamente"
         }
+    except HTTPException:
+        raise
     except Exception as e:
+        print(f" ERROR CRÍTICO EN PREDICCIÓN: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Error al generar predicción: {str(e)}")
+
+@app.get("/predicciones-historicas")
+def predicciones_historicas():
+    """
+    Genera predicciones para datos históricos y compara con valores reales
+    """
+    try:
+        print("\n Generando predicciones históricas...")
+        
+        # 1. Cargar datos históricos de MySQL
+        connection = get_db_connection()
+        cursor = connection.cursor()
+        
+        cursor.execute("""
+            SELECT fecha, checkin_nacionales, checkin_extranjeros, 
+                   pernoctaciones, habitaciones_ocupadas, tarifa_cobrada, 
+                   ocupacion_porcentaje
+            FROM ocupacion_hotelera
+            ORDER BY fecha DESC
+            LIMIT 30
+        """)
+        
+        datos_reales = cursor.fetchall()
+        cursor.close()
+        connection.close()
+        
+        if not datos_reales:
+            raise HTTPException(status_code=404, detail="No hay datos históricos")
+        
+        # 2. Cargar el modelo entrenado
+        if not modelo.modelo_entrenado:
+            modelo.cargar_modelo()
+        
+        # 3. Generar predicciones para cada registro histórico
+        resultados = []
+        for row in datos_reales:
+            datos_input = {
+                'fecha': row['fecha'].strftime('%Y-%m-%d'),
+                'checkin_nacionales': row['checkin_nacionales'],
+                'checkin_extranjeros': row['checkin_extranjeros'],
+                'pernoctaciones': row['pernoctaciones'],
+                'habitaciones_ocupadas': row['habitaciones_ocupadas'],
+                'tarifa_cobrada': float(row['tarifa_cobrada']),
+                'temperatura': 26,  # Valor por defecto si no hay
+                'humedad': 70,
+                'precipitacion': 0,
+                'total_dias': 3,
+                'temporada': 'Media'
+            }
+            
+            # Preprocesar y predecir
+            df_input = pd.DataFrame([datos_input])
+            df_input = modelo.preprocesar(df_input)
+            
+            # Alinear columnas
+            if hasattr(modelo.modelos[modelo.nombre_modelo], 'feature_names_in_'):
+                expected_features = modelo.modelos[modelo.nombre_modelo].feature_names_in_
+                for col in expected_features:
+                    if col not in df_input.columns:
+                        df_input[col] = 0
+                df_input = df_input[expected_features]
+            
+            prediccion = modelo.modelos[modelo.nombre_modelo].predict(df_input)[0]
+            prediccion = max(0, min(100, prediccion))
+            
+            # Calcular error
+            valor_real = float(row['ocupacion_porcentaje'])
+            error = abs(valor_real - prediccion)
+            
+            resultados.append({
+                'fecha': row['fecha'].strftime('%Y-%m-%d'),
+                'valor_real': round(valor_real, 2),
+                'valor_predicho': round(prediccion, 2),
+                'error': round(error, 2),
+                'precision': round(100 - error, 2)
+            })
+        
+        # 4. Calcular métricas generales
+        errores = [r['error'] for r in resultados]
+        precision_promedio = sum(r['precision'] for r in resultados) / len(resultados)
+        
+        return {
+            'total_registros': len(resultados),
+            'precision_promedio': round(precision_promedio, 2),
+            'error_promedio': round(sum(errores) / len(errores), 2),
+            'modelo_usado': modelo.nombre_modelo,
+            'predicciones': resultados
+        }
+        
+    except Exception as e:
+        print(f" ERROR en predicciones históricas: {str(e)}")
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/metricas")
-def obtener_metricas():
-    if modelo.modelo_entrenado is None:
-        if not modelo.cargar_modelo():
-            raise HTTPException(status_code=404, detail="No hay modelo entrenado")
-    return {"modelo": modelo.nombre_modelo, "metricas": modelo.metricas}
-
 
 if __name__ == "__main__":
     print("\n" + "="*60)
