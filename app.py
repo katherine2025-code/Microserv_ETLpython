@@ -25,7 +25,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["http://localhost:8100"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -502,11 +502,11 @@ def predecir_ocupacion(request: PrediccionRequest):
         
         # Verificar si hay modelo entrenado
         if modelo.modelo_entrenado is None:
-            print("⚠️ No hay modelo en memoria, intentando cargar desde archivo...")
+            print(" No hay modelo en memoria, intentando cargar desde archivo...")
             if not modelo.cargar_modelo():
-                print("❌ ERROR: No se pudo cargar el modelo")
+                print(" ERROR: No se pudo cargar el modelo")
                 raise HTTPException(status_code=400, detail="No hay modelo entrenado. Primero ejecuta /entrenar")
-            print("✅ Modelo cargado exitosamente")
+            print(" Modelo cargado exitosamente")
         
         # Preparar datos para predicción
         datos = {
@@ -521,7 +521,7 @@ def predecir_ocupacion(request: PrediccionRequest):
             'temporada': request.temporada or "Media"
         }
         
-        print(f"📊 Datos para predicción: {datos}")
+        print(f" Datos para predicción: {datos}")
         
         # Generar predicción
         prediccion = modelo.predecir(datos)
@@ -529,7 +529,7 @@ def predecir_ocupacion(request: PrediccionRequest):
         
         error_estimado = modelo.metricas.get('rmse', 5)
         
-        print(f"✅ Predicción generada: {prediccion}%")
+        print(f" Predicción generada: {prediccion}%")
         
         return {
             "fecha_objetivo": request.fecha_objetivo,
@@ -568,6 +568,8 @@ def predicciones_historicas():
                    pernoctaciones, habitaciones_ocupadas, tarifa_cobrada, 
                    ocupacion_porcentaje
             FROM ocupacion_hotelera
+            WHERE ocupacion_porcentaje IS NOT NULL 
+              AND ocupacion_porcentaje > 0
             ORDER BY fecha DESC
             LIMIT 30
         """)
@@ -577,73 +579,94 @@ def predicciones_historicas():
         connection.close()
         
         if not datos_reales:
-            raise HTTPException(status_code=404, detail="No hay datos históricos")
+            raise HTTPException(status_code=404, detail="No hay datos históricos disponibles")
+        
+        print(f"    Datos históricos encontrados: {len(datos_reales)} registros")
         
         # 2. Cargar el modelo entrenado
         if not modelo.modelo_entrenado:
-            modelo.cargar_modelo()
+            print("    Cargando modelo desde archivo...")
+            if not modelo.cargar_modelo():
+                raise HTTPException(status_code=400, detail="No hay modelo entrenado. Primero ejecuta /entrenar")
         
         # 3. Generar predicciones para cada registro histórico
         resultados = []
         for row in datos_reales:
-            datos_input = {
-                'fecha': row['fecha'].strftime('%Y-%m-%d'),
-                'checkin_nacionales': row['checkin_nacionales'],
-                'checkin_extranjeros': row['checkin_extranjeros'],
-                'pernoctaciones': row['pernoctaciones'],
-                'habitaciones_ocupadas': row['habitaciones_ocupadas'],
-                'tarifa_cobrada': float(row['tarifa_cobrada']),
-                'temperatura': 26,  # Valor por defecto si no hay
-                'humedad': 70,
-                'precipitacion': 0,
-                'total_dias': 3,
-                'temporada': 'Media'
-            }
-            
-            # Preprocesar y predecir
-            df_input = pd.DataFrame([datos_input])
-            df_input = modelo.preprocesar(df_input)
-            
-            # Alinear columnas
-            if hasattr(modelo.modelos[modelo.nombre_modelo], 'feature_names_in_'):
-                expected_features = modelo.modelos[modelo.nombre_modelo].feature_names_in_
-                for col in expected_features:
-                    if col not in df_input.columns:
-                        df_input[col] = 0
-                df_input = df_input[expected_features]
-            
-            prediccion = modelo.modelos[modelo.nombre_modelo].predict(df_input)[0]
-            prediccion = max(0, min(100, prediccion))
-            
-            # Calcular error
-            valor_real = float(row['ocupacion_porcentaje'])
-            error = abs(valor_real - prediccion)
-            
-            resultados.append({
-                'fecha': row['fecha'].strftime('%Y-%m-%d'),
-                'valor_real': round(valor_real, 2),
-                'valor_predicho': round(prediccion, 2),
-                'error': round(error, 2),
-                'precision': round(100 - error, 2)
-            })
+            try:
+                datos_input = {
+                    'fecha': row['fecha'].strftime('%Y-%m-%d') if row['fecha'] else '2026-01-01',
+                    'checkin_nacionales': int(row['checkin_nacionales'] or 0),
+                    'checkin_extranjeros': int(row['checkin_extranjeros'] or 0),
+                    'pernoctaciones': int(row['pernoctaciones'] or 0),
+                    'habitaciones_ocupadas': int(row['habitaciones_ocupadas'] or 0),
+                    'tarifa_cobrada': float(row['tarifa_cobrada'] or 0),
+                    'temperatura': 26.0,
+                    'humedad': 70.0,
+                    'precipitacion': 0.0,
+                    'total_dias': 3,
+                    'temporada': 'Media'
+                }
+                
+                # Preprocesar
+                df_input = pd.DataFrame([datos_input])
+                df_input = modelo.preprocesar(df_input)
+                
+                # Alinear columnas
+                modelo_actual = modelo.modelos.get(modelo.nombre_modelo)
+                if modelo_actual and hasattr(modelo_actual, 'feature_names_in_'):
+                    expected_features = modelo_actual.feature_names_in_
+                    for col in expected_features:
+                        if col not in df_input.columns:
+                            df_input[col] = 0
+                    df_input = df_input[expected_features]
+                
+                # Predecir
+                prediccion = modelo_actual.predict(df_input)[0]
+                prediccion = float(max(0, min(100, prediccion)))  # ✅ CONVERTIR A FLOAT NATIVO
+                
+                # Calcular error
+                valor_real = float(row['ocupacion_porcentaje'])  # ✅ CONVERTIR A FLOAT NATIVO
+                error = abs(valor_real - prediccion)
+                
+                resultados.append({
+                    'fecha': row['fecha'].strftime('%Y-%m-%d') if row['fecha'] else '2026-01-01',
+                    'valor_real': round(float(valor_real), 2),  # ✅ CONVERTIR
+                    'valor_predicho': round(float(prediccion), 2),  # ✅ CONVERTIR
+                    'error': round(float(error), 2),  # ✅ CONVERTIR
+                    'precision': round(float(100 - error), 2)  # ✅ CONVERTIR
+                })
+                
+            except Exception as e:
+                print(f"    Error procesando fila: {str(e)}")
+                continue
         
-        # 4. Calcular métricas generales
-        errores = [r['error'] for r in resultados]
-        precision_promedio = sum(r['precision'] for r in resultados) / len(resultados)
+        if not resultados:
+            raise HTTPException(status_code=500, detail="No se pudieron generar predicciones")
         
-        return {
-            'total_registros': len(resultados),
-            'precision_promedio': round(precision_promedio, 2),
-            'error_promedio': round(sum(errores) / len(errores), 2),
-            'modelo_usado': modelo.nombre_modelo,
+        # 4. Calcular métricas generales (CONVERTIR A FLOAT NATIVO)
+        errores = [float(r['error']) for r in resultados]
+        precision_promedio = sum(float(r['precision']) for r in resultados) / len(resultados)
+        
+        respuesta = {
+            'total_registros': int(len(resultados)),  # ✅ CONVERTIR A INT
+            'precision_promedio': round(float(precision_promedio), 2),  # ✅ CONVERTIR
+            'error_promedio': round(float(sum(errores) / len(errores)), 2),  # ✅ CONVERTIR
+            'modelo_usado': str(modelo.nombre_modelo),  # ✅ CONVERTIR A STR
             'predicciones': resultados
         }
         
+        print(f"    Predicciones históricas generadas: {len(resultados)} registros")
+        print(f"    Precisión promedio: {respuesta['precision_promedio']}%")
+        
+        return respuesta
+        
+    except HTTPException:
+        raise
     except Exception as e:
-        print(f" ERROR en predicciones históricas: {str(e)}")
+        print(f"❌ ERROR en predicciones históricas: {str(e)}")
         import traceback
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Error interno: {str(e)}")
 
 if __name__ == "__main__":
     print("\n" + "="*60)
