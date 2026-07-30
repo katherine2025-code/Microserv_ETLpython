@@ -64,13 +64,12 @@ def get_db_connection():
 # ==========================================
 # ENDPOINTS ETL
 # ==========================================
-
 @app.post("/etl/procesar")
-async def procesar_csv(file: UploadFile = File(...), tipo: str = "encuestas"):
+async def procesar_csv(file: UploadFile = File(...), tipo: str = None):
     try:
         contents = await file.read()
-        print(f"\n Intentando leer CSV tipo: {tipo}")
-        print(f"Tamaño del archivo: {len(contents)} bytes")
+        print(f"\n🔍 Intentando leer CSV...")
+        print(f"📏 Tamaño del archivo: {len(contents)} bytes")
         
         mejor_df = None
         separadores = [';', ',', '\t']
@@ -84,7 +83,7 @@ async def procesar_csv(file: UploadFile = File(...), tipo: str = "encuestas"):
                         primera_col = str(df_temp.columns[0]).lower()
                         if sep not in primera_col:
                             mejor_df = pd.read_csv(io.BytesIO(contents), sep=sep, encoding=enc, on_bad_lines='skip')
-                            print(f" Lectura exitosa con separador '{sep}' y encoding '{enc}'")
+                            print(f"✅ Lectura exitosa con separador '{sep}' y encoding '{enc}'")
                             break
                 except Exception:
                     continue
@@ -95,10 +94,48 @@ async def procesar_csv(file: UploadFile = File(...), tipo: str = "encuestas"):
             raise HTTPException(status_code=400, detail="No se pudo leer el CSV. Verifica que sea un archivo válido.")
         
         df = mejor_df
-        print(f"\nProcesando CSV tipo: {tipo}")
-        print(f"Filas leídas: {len(df)}")
-        print(f"Columnas encontradas: {len(df.columns)}")
-        print(f"Primeras columnas: {list(df.columns)[:5]}")
+        columnas_lower = [str(col).lower() for col in df.columns]
+        
+        print(f"\n📊 Columnas encontradas: {list(df.columns)}")
+        print(f"📋 Columnas en minúsculas: {columnas_lower}")
+        
+        # ==========================================
+        # DETECCIÓN AUTOMÁTICA DE TIPO
+        # ==========================================
+        if tipo is None or tipo == '':
+            print("\n🔎 Tipo no especificado, detectando automáticamente...")
+            
+            # Detectar Ocupación Hotelera
+            if any(col in columnas_lower for col in ['id_hotel', 'ocupacion_porcentaje', 'checkin_nacionales']):
+                tipo = 'ocupacion'
+                print("✅ Detectado: OCUPACIÓN HOTELERA")
+            
+            # Detectar Clima
+            elif any(col in columnas_lower for col in ['temperatura', 'humedad', 'precipitacion']):
+                tipo = 'clima'
+                print("✅ Detectado: CLIMA")
+            
+            # Detectar Feriados
+            elif any(col in columnas_lower for col in ['fecha_inicio', 'fecha_fin', 'temporada']):
+                tipo = 'feriados'
+                print("✅ Detectado: FERIADOS")
+            
+            # Detectar Encuestas
+            elif any(col in columnas_lower for col in ['genero', 'edad', 'pais_residencia', 'nivel_satisfaccion']):
+                tipo = 'encuestas'
+                print("✅ Detectado: ENCUESTAS")
+            
+            else:
+                raise HTTPException(
+                    status_code=400, 
+                    detail=f"No se pudo detectar el tipo de datos. Columnas: {columnas_lower}"
+                )
+        else:
+            print(f"\n✅ Tipo especificado: {tipo}")
+        
+        print(f"\n🚀 Procesando CSV tipo: {tipo}")
+        print(f"📈 Filas leídas: {len(df)}")
+        print(f"📊 Columnas encontradas: {len(df.columns)}")
         
         if tipo == 'ocupacion':
             resultado = procesar_ocupacion(df)
@@ -124,11 +161,10 @@ async def procesar_csv(file: UploadFile = File(...), tipo: str = "encuestas"):
     except HTTPException:
         raise
     except Exception as e:
-        print(f" Error general procesando CSV: {str(e)}")
+        print(f"❌ Error general procesando CSV: {str(e)}")
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error procesando CSV: {str(e)}")
-
 
 def procesar_ocupacion(df):
     connection = get_db_connection()
@@ -160,7 +196,10 @@ def procesar_ocupacion(df):
                 insertados += 1
             except Exception as e:
                 errores += 1
-                detalles.append(f"Fila {int(index) + 1}: {str(e)}")
+                # ✅ AGREGADO: Imprimir el error real en la consola de Python
+                error_msg = f"Fila {int(index) + 1}: {str(e)}"
+                detalles.append(error_msg)
+                print(f"⚠️ ERROR EN FILA {int(index) + 1}: {str(e)}") # <-- ESTO ES CLAVE
         connection.commit()
     except Exception as e:
         connection.rollback()
