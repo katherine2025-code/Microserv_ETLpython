@@ -68,8 +68,8 @@ def get_db_connection():
 async def procesar_csv(file: UploadFile = File(...), tipo: str = None):
     try:
         contents = await file.read()
-        print(f"\n🔍 Intentando leer CSV...")
-        print(f"📏 Tamaño del archivo: {len(contents)} bytes")
+        print(f"\n Intentando leer CSV...")
+        print(f" Tamaño del archivo: {len(contents)} bytes")
         
         mejor_df = None
         separadores = [';', ',', '\t']
@@ -83,7 +83,7 @@ async def procesar_csv(file: UploadFile = File(...), tipo: str = None):
                         primera_col = str(df_temp.columns[0]).lower()
                         if sep not in primera_col:
                             mejor_df = pd.read_csv(io.BytesIO(contents), sep=sep, encoding=enc, on_bad_lines='skip')
-                            print(f"✅ Lectura exitosa con separador '{sep}' y encoding '{enc}'")
+                            print(f" Lectura exitosa con separador '{sep}' y encoding '{enc}'")
                             break
                 except Exception:
                     continue
@@ -96,34 +96,34 @@ async def procesar_csv(file: UploadFile = File(...), tipo: str = None):
         df = mejor_df
         columnas_lower = [str(col).lower() for col in df.columns]
         
-        print(f"\n📊 Columnas encontradas: {list(df.columns)}")
-        print(f"📋 Columnas en minúsculas: {columnas_lower}")
+        print(f"\n Columnas encontradas: {list(df.columns)}")
+        print(f" Columnas en minúsculas: {columnas_lower}")
         
         # ==========================================
         # DETECCIÓN AUTOMÁTICA DE TIPO
         # ==========================================
         if tipo is None or tipo == '':
-            print("\n🔎 Tipo no especificado, detectando automáticamente...")
+            print("\n Tipo no especificado, detectando automáticamente...")
             
             # Detectar Ocupación Hotelera
             if any(col in columnas_lower for col in ['id_hotel', 'ocupacion_porcentaje', 'checkin_nacionales']):
                 tipo = 'ocupacion'
-                print("✅ Detectado: OCUPACIÓN HOTELERA")
+                print(" Detectado: OCUPACIÓN HOTELERA")
             
             # Detectar Clima
             elif any(col in columnas_lower for col in ['temperatura', 'humedad', 'precipitacion']):
                 tipo = 'clima'
-                print("✅ Detectado: CLIMA")
+                print(" Detectado: CLIMA")
             
             # Detectar Feriados
             elif any(col in columnas_lower for col in ['fecha_inicio', 'fecha_fin', 'temporada']):
                 tipo = 'feriados'
-                print("✅ Detectado: FERIADOS")
+                print(" Detectado: FERIADOS")
             
             # Detectar Encuestas
             elif any(col in columnas_lower for col in ['genero', 'edad', 'pais_residencia', 'nivel_satisfaccion']):
                 tipo = 'encuestas'
-                print("✅ Detectado: ENCUESTAS")
+                print(" Detectado: ENCUESTAS")
             
             else:
                 raise HTTPException(
@@ -131,11 +131,11 @@ async def procesar_csv(file: UploadFile = File(...), tipo: str = None):
                     detail=f"No se pudo detectar el tipo de datos. Columnas: {columnas_lower}"
                 )
         else:
-            print(f"\n✅ Tipo especificado: {tipo}")
+            print(f"\n Tipo especificado: {tipo}")
         
-        print(f"\n🚀 Procesando CSV tipo: {tipo}")
-        print(f"📈 Filas leídas: {len(df)}")
-        print(f"📊 Columnas encontradas: {len(df.columns)}")
+        print(f"\n Procesando CSV tipo: {tipo}")
+        print(f" Filas leídas: {len(df)}")
+        print(f" Columnas encontradas: {len(df.columns)}")
         
         if tipo == 'ocupacion':
             resultado = procesar_ocupacion(df)
@@ -161,7 +161,7 @@ async def procesar_csv(file: UploadFile = File(...), tipo: str = None):
     except HTTPException:
         raise
     except Exception as e:
-        print(f"❌ Error general procesando CSV: {str(e)}")
+        print(f"Error general procesando CSV: {str(e)}")
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error procesando CSV: {str(e)}")
@@ -591,27 +591,49 @@ def predecir_ocupacion(request: PrediccionRequest):
         raise HTTPException(status_code=500, detail=f"Error al generar predicción: {str(e)}")
 
 @app.get("/predicciones-historicas")
-def predicciones_historicas():
+def predicciones_historicas(limite: int = None, dias: int = None):
     """
     Genera predicciones para datos históricos y compara con valores reales
+    
+    Args:
+        limite: Número máximo de registros a validar (opcional, default: todos)
+        dias: Número de días hacia atrás para validar (opcional)
     """
     try:
         print("\n Generando predicciones históricas...")
         
-        # 1. Cargar datos históricos de MySQL
         connection = get_db_connection()
         cursor = connection.cursor()
         
-        cursor.execute("""
+        # Construir consulta dinámica
+        query = """
             SELECT fecha, checkin_nacionales, checkin_extranjeros, 
                    pernoctaciones, habitaciones_ocupadas, tarifa_cobrada, 
                    ocupacion_porcentaje
             FROM ocupacion_hotelera
             WHERE ocupacion_porcentaje IS NOT NULL 
               AND ocupacion_porcentaje > 0
-            ORDER BY fecha DESC
-            LIMIT 30
-        """)
+        """
+        
+        params = []
+        
+        # Si se especifica número de días, filtrar por fecha
+        if dias is not None:
+            query += " AND fecha >= DATE_SUB(NOW(), INTERVAL %s DAY)"
+            params.append(dias)
+            print(f"    Filtrando últimos {dias} días...")
+        
+        query += " ORDER BY fecha DESC"
+        
+        # Si se especifica un límite, aplicarlo
+        if limite is not None:
+            query += " LIMIT %s"
+            params.append(limite)
+            print(f"    Límite: {limite} registros...")
+        else:
+            print("    Procesando TODOS los registros disponibles...")
+        
+        cursor.execute(query, params)
         
         datos_reales = cursor.fetchall()
         cursor.close()
@@ -620,7 +642,7 @@ def predicciones_historicas():
         if not datos_reales:
             raise HTTPException(status_code=404, detail="No hay datos históricos disponibles")
         
-        print(f"    Datos históricos encontrados: {len(datos_reales)} registros")
+        print(f"     Datos históricos encontrados: {len(datos_reales)} registros")
         
         # 2. Cargar el modelo entrenado
         if not modelo.modelo_entrenado:
@@ -630,6 +652,8 @@ def predicciones_historicas():
         
         # 3. Generar predicciones para cada registro histórico
         resultados = []
+        registros_procesados = 0
+        
         for row in datos_reales:
             try:
                 datos_input = {
@@ -661,52 +685,64 @@ def predicciones_historicas():
                 
                 # Predecir
                 prediccion = modelo_actual.predict(df_input)[0]
-                prediccion = float(max(0, min(100, prediccion)))  # ✅ CONVERTIR A FLOAT NATIVO
+                prediccion = float(max(0, min(100, prediccion)))
                 
                 # Calcular error
-                valor_real = float(row['ocupacion_porcentaje'])  # ✅ CONVERTIR A FLOAT NATIVO
+                valor_real = float(row['ocupacion_porcentaje'])
                 error = abs(valor_real - prediccion)
                 
                 resultados.append({
                     'fecha': row['fecha'].strftime('%Y-%m-%d') if row['fecha'] else '2026-01-01',
-                    'valor_real': round(float(valor_real), 2),  # ✅ CONVERTIR
-                    'valor_predicho': round(float(prediccion), 2),  # ✅ CONVERTIR
-                    'error': round(float(error), 2),  # ✅ CONVERTIR
-                    'precision': round(float(100 - error), 2)  # ✅ CONVERTIR
+                    'valor_real': round(float(valor_real), 2),
+                    'valor_predicho': round(float(prediccion), 2),
+                    'error': round(float(error), 2),
+                    'precision': round(float(100 - error), 2)
                 })
                 
+                registros_procesados += 1
+                
+                # Mostrar progreso cada 100 registros
+                if registros_procesados % 100 == 0:
+                    print(f"    Procesados: {registros_procesados} registros...")
+                
             except Exception as e:
-                print(f"    Error procesando fila: {str(e)}")
+                print(f"     Error procesando fila: {str(e)}")
                 continue
         
         if not resultados:
             raise HTTPException(status_code=500, detail="No se pudieron generar predicciones")
         
-        # 4. Calcular métricas generales (CONVERTIR A FLOAT NATIVO)
+        # 4. Calcular métricas generales
         errores = [float(r['error']) for r in resultados]
         precision_promedio = sum(float(r['precision']) for r in resultados) / len(resultados)
         
         respuesta = {
-            'total_registros': int(len(resultados)),  # ✅ CONVERTIR A INT
-            'precision_promedio': round(float(precision_promedio), 2),  # ✅ CONVERTIR
-            'error_promedio': round(float(sum(errores) / len(errores)), 2),  # ✅ CONVERTIR
-            'modelo_usado': str(modelo.nombre_modelo),  # ✅ CONVERTIR A STR
+            'total_registros': int(len(resultados)),
+            'precision_promedio': round(float(precision_promedio), 2),
+            'error_promedio': round(float(sum(errores) / len(errores)), 2),
+            'modelo_usado': str(modelo.nombre_modelo),
             'predicciones': resultados
         }
         
-        print(f"    Predicciones históricas generadas: {len(resultados)} registros")
-        print(f"    Precisión promedio: {respuesta['precision_promedio']}%")
+        print(f"\n" + "="*60)
+        print(" VALIDACIÓN HISTÓRICA COMPLETADA")
+        print("="*60)
+        print(f" Total registros: {len(resultados)}")
+        print(f" Precisión promedio: {respuesta['precision_promedio']}%")
+        print(f" Error promedio: {respuesta['error_promedio']}%")
+        print("="*60)
         
         return respuesta
         
     except HTTPException:
         raise
     except Exception as e:
-        print(f"❌ ERROR en predicciones históricas: {str(e)}")
+        print(f" ERROR en predicciones históricas: {str(e)}")
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error interno: {str(e)}")
 
+    
 if __name__ == "__main__":
     print("\n" + "="*60)
     print("Microservicio ML - OTS Santa Elena")
