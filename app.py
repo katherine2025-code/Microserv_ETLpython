@@ -494,6 +494,11 @@ class PrediccionRequest(BaseModel):
     total_dias: Optional[float] = 0
     temporada: Optional[str] = "Media"
 
+class PrediccionRangoRequest(BaseModel):
+    fecha_inicio: str
+    fecha_fin: str
+    id_hotel: Optional[int] = 1
+
 @app.get("/")
 def raiz():
     return {"servicio": "Microservicio ML - OTS Santa Elena", "version": "1.0.0", "estado": "operativo"}
@@ -563,22 +568,47 @@ def predecir_ocupacion(request: PrediccionRequest):
         print(f" Datos para predicción: {datos}")
         
         # Generar predicción
-        prediccion = modelo.predecir(datos)
-        prediccion = max(0, min(100, prediccion))  # Asegurar que esté entre 0-100
+        prediccion_val = modelo.predecir(datos)
+        prediccion_float = float(max(0, min(100, prediccion_val)))  # Asegurar que esté entre 0-100 y sea float nativo de Python
         
-        error_estimado = modelo.metricas.get('rmse', 5)
+        error_estimado = float(modelo.metricas.get('rmse', 5))
+        precision_modelo = float(modelo.metricas.get('precision', 85.0))
         
-        print(f" Predicción generada: {prediccion}%")
+        print(f" Predicción generada: {prediccion_float}%")
+
+        # ✅ Guardar predicción generada en la base de datos MySQL (tabla predicciones)
+        try:
+            conn = get_db_connection()
+            with conn.cursor() as cursor:
+                sql_insert = """
+                    INSERT INTO predicciones 
+                    (id_hotel, fecha_objetivo, fecha_generacion, ocupacion_predicha, 
+                     precision_modelo, modelo_utilizado, estado)
+                    VALUES (%s, %s, NOW(), %s, %s, %s, %s)
+                """
+                cursor.execute(sql_insert, (
+                    1, # id_hotel por defecto
+                    request.fecha_objetivo,
+                    round(prediccion_float, 2),
+                    round(precision_modelo, 2),
+                    str(modelo.nombre_modelo),
+                    'pendiente'
+                ))
+            conn.commit()
+            conn.close()
+            print(" Predicción guardada exitosamente en la base de datos MySQL")
+        except Exception as db_err:
+            print(f"⚠️ Advertencia al guardar en BD: {str(db_err)}")
         
         return {
             "fecha_objetivo": request.fecha_objetivo,
-            "ocupacion_predicha": round(float(prediccion), 2),
-            "modelo": modelo.nombre_modelo,
-            "precision": round(modelo.metricas.get('precision', 0), 2),
+            "ocupacion_predicha": round(prediccion_float, 2),
+            "modelo": str(modelo.nombre_modelo),
+            "precision": round(precision_modelo, 2),
             "error_estimado": round(error_estimado, 2),
             "rango_prediccion": {
-                "minimo": round(max(0, prediccion - error_estimado), 2),
-                "maximo": round(min(100, prediccion + error_estimado), 2)
+                "minimo": round(max(0, prediccion_float - error_estimado), 2),
+                "maximo": round(min(100, prediccion_float + error_estimado), 2)
             },
             "mensaje": "Predicción de Ocupación Hotelera generada exitosamente"
         }
@@ -589,6 +619,151 @@ def predecir_ocupacion(request: PrediccionRequest):
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error al generar predicción: {str(e)}")
+
+@app.post("/predecir-rango")
+def predecir_ocupacion_rango(request: PrediccionRangoRequest):
+    """
+    Genera la proyección de ocupación hotelera día por día para un rango de fechas.
+    Ideal para investigadores y analistas de turismo.
+    """
+    try:
+        print("\n GENERANDO PROYECCIÓN POR RANGO DE FECHAS...")
+        print(f" Desde: {request.fecha_inicio} Hasta: {request.fecha_fin}")
+        
+        # Verificar modelo entrenado
+        if not modelo.modelo_entrenado:
+            if not modelo.cargar_modelo():
+                raise HTTPException(status_code=400, detail="No hay modelo entrenado. Ejecuta primero /entrenar.")
+                
+        start_date = pd.to_datetime(request.fecha_inicio)
+        end_date = pd.to_datetime(request.fecha_fin)
+        
+        if start_date > end_date:
+            raise HTTPException(status_code=400, detail="La fecha de inicio no puede ser posterior a la fecha de fin.")
+            
+        dias_diferencia = (end_date - start_date).days + 1
+        if dias_diferencia > 60:
+            raise HTTPException(status_code=400, detail="El rango máximo permitido es de 60 días.")
+            
+        connection = get_db_connection()
+        cursor = connection.cursor()
+        
+        # Consultar clima y feriados existentes para el rango de fechas
+        query_clima = "SELECT fecha, temperatura, humedad, precipitacion FROM clima WHERE fecha BETWEEN %s AND %s"
+        cursor.execute(query_clima, (request.fecha_inicio, request.fecha_fin))
+        clima_dict = {row['fecha'].strftime('%Y-%m-%d'): row for row in cursor.fetchall()}
+        
+        query_feriados = "SELECT fecha_inicio, fecha_fin, temporada, total_dias FROM feriados WHERE fecha_inicio <= %s AND fecha_fin >= %s"
+        cursor.execute(query_feriados, (request.fecha_fin, request.fecha_inicio))
+        feriados_list = cursor.fetchall()
+        cursor.close()
+        connection.close()
+        
+        predicciones_diarias = []
+        fechas_rango = pd.date_range(start_date, end_date)
+        
+        for fecha_dt in fechas_rango:
+            fecha_str = fecha_dt.strftime('%Y-%m-%d')
+            es_fin_semana = 1 if fecha_dt.dayofweek >= 5 else 0
+            
+            # Buscar clima de la BD o usar promedio estimado
+            info_clima = clima_dict.get(fecha_str, {})
+            temp = float(info_clima.get('temperatura', 26.0))
+            hum = float(info_clima.get('humedad', 70.0))
+            prec = float(info_clima.get('precipitacion', 0.0))
+            
+            # Buscar si hay feriado activo
+            temporada = "Media"
+            total_dias_feriado = 1
+            for f in feriados_list:
+                f_ini = pd.to_datetime(f['fecha_inicio'])
+                f_fin = pd.to_datetime(f['fecha_fin'])
+                if f_ini <= fecha_dt <= f_fin:
+                    temporada = f.get('temporada', 'Alta')
+                    total_dias_feriado = f.get('total_dias', 3)
+                    break
+                    
+            if es_fin_semana and temporada == "Media":
+                temporada = "Alta"
+                
+            # Construir datos de entrada
+            datos_dia = {
+                'fecha': fecha_str,
+                'checkin_nacionales': 60 if temporada == "Alta" else 35,
+                'checkin_extranjeros': 20 if temporada == "Alta" else 8,
+                'tarifa_cobrada': 90.0 if temporada == "Alta" else 70.0,
+                'temperatura': temp,
+                'humedad': hum,
+                'precipitacion': prec,
+                'total_dias': total_dias_feriado,
+                'temporada': temporada
+            }
+            
+            val_pred = modelo.predecir(datos_dia)
+            val_pred = round(float(max(0, min(100, val_pred))), 2)
+            
+            predicciones_diarias.append({
+                'fecha': fecha_str,
+                'ocupacion_predicha': val_pred,
+                'dia_semana': fecha_dt.strftime('%A'),
+                'es_fin_semana': bool(es_fin_semana),
+                'temporada': temporada,
+                'temperatura': temp
+            })
+            
+        # Calcular agregaciones avanzadas para el Investigador Turístico
+        valores = [p['ocupacion_predicha'] for p in predicciones_diarias]
+        promedio = round(sum(valores) / len(valores), 2)
+        pico = max(predicciones_diarias, key=lambda x: x['ocupacion_predicha'])
+        valle = min(predicciones_diarias, key=lambda x: x['ocupacion_predicha'])
+        
+        # 1. Agrupación por día de la semana (Lunes, Martes, etc.)
+        dias_semana_map = {}
+        for p in predicciones_diarias:
+            d_nom = p['dia_semana']
+            if d_nom not in dias_semana_map:
+                dias_semana_map[d_nom] = []
+            dias_semana_map[d_nom].append(p['ocupacion_predicha'])
+            
+        promedios_dia_semana = {d: round(sum(vals)/len(vals), 2) for d, vals in dias_semana_map.items()}
+        
+        # 2. Agrupación por temporada (Alta, Media, Baja)
+        temporada_map = {}
+        for p in predicciones_diarias:
+            temp_nom = p['temporada']
+            if temp_nom not in temporada_map:
+                temporada_map[temp_nom] = []
+            temporada_map[temp_nom].append(p['ocupacion_predicha'])
+            
+        promedios_temporada = {t: round(sum(vals)/len(vals), 2) for t, vals in temporada_map.items()}
+        
+        # 3. Métricas proyectadas de impacto económico y afluencia
+        turistas_estimados_totales = int(sum(p['ocupacion_predicha'] * 2.2 for p in predicciones_diarias))
+        ingresos_estimados_usd = round(sum(p['ocupacion_predicha'] * 85.0 for p in predicciones_diarias), 2)
+        dias_alta_demanda = len([p for p in predicciones_diarias if p['ocupacion_predicha'] >= 60])
+        
+        return {
+            'fecha_inicio': request.fecha_inicio,
+            'fecha_fin': request.fecha_fin,
+            'total_dias': len(predicciones_diarias),
+            'ocupacion_promedio': promedio,
+            'dia_pico': pico,
+            'dia_valle': valle,
+            'turistas_estimados_totales': turistas_estimados_totales,
+            'ingresos_estimados_usd': ingresos_estimados_usd,
+            'dias_alta_demanda': dias_alta_demanda,
+            'promedios_dia_semana': promedios_dia_semana,
+            'promedios_temporada': promedios_temporada,
+            'modelo_usado': str(modelo.nombre_modelo),
+            'predicciones_diarias': predicciones_diarias
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f" ERROR en predicción por rango: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Error en proyección por rango: {str(e)}")
 
 @app.get("/predicciones-historicas")
 def predicciones_historicas(limite: int = None, dias: int = None):
@@ -607,12 +782,19 @@ def predicciones_historicas(limite: int = None, dias: int = None):
         
         # Construir consulta dinámica
         query = """
-            SELECT fecha, checkin_nacionales, checkin_extranjeros, 
-                   pernoctaciones, habitaciones_ocupadas, tarifa_cobrada, 
-                   ocupacion_porcentaje
-            FROM ocupacion_hotelera
-            WHERE ocupacion_porcentaje IS NOT NULL 
-              AND ocupacion_porcentaje > 0
+            SELECT oh.fecha, oh.checkin_nacionales, oh.checkin_extranjeros, 
+                   oh.pernoctaciones, oh.habitaciones_ocupadas, oh.tarifa_cobrada, 
+                   oh.ocupacion_porcentaje,
+                   COALESCE(c.temperatura, 25.0) AS temperatura,
+                   COALESCE(c.humedad, 70.0) AS humedad,
+                   COALESCE(c.precipitacion, 0.0) AS precipitacion,
+                   COALESCE(f.total_dias, 1) AS total_dias,
+                   COALESCE(f.temporada, 'Media') AS temporada
+            FROM ocupacion_hotelera oh
+            LEFT JOIN clima c ON oh.fecha = c.fecha
+            LEFT JOIN feriados f ON oh.fecha BETWEEN f.fecha_inicio AND f.fecha_fin
+            WHERE oh.ocupacion_porcentaje IS NOT NULL 
+              AND oh.ocupacion_porcentaje > 0
         """
         
         params = []
@@ -663,11 +845,11 @@ def predicciones_historicas(limite: int = None, dias: int = None):
                     'pernoctaciones': int(row['pernoctaciones'] or 0),
                     'habitaciones_ocupadas': int(row['habitaciones_ocupadas'] or 0),
                     'tarifa_cobrada': float(row['tarifa_cobrada'] or 0),
-                    'temperatura': 26.0,
-                    'humedad': 70.0,
-                    'precipitacion': 0.0,
-                    'total_dias': 3,
-                    'temporada': 'Media'
+                    'temperatura': float(row['temperatura']),
+                    'humedad': float(row['humedad']),
+                    'precipitacion': float(row['precipitacion']),
+                    'total_dias': int(row['total_dias']),
+                    'temporada': str(row['temporada'])
                 }
                 
                 # Preprocesar
