@@ -26,14 +26,14 @@ def obtener_dataset_ml():
                 oh.habitaciones_ocupadas,
                 oh.tarifa_cobrada,
                 oh.ocupacion_porcentaje,
-                c.temperatura,
-                c.humedad,
-                c.precipitacion,
-                f.total_dias,
-                f.temporada
+                COALESCE(c.temperatura, 25.0) AS temperatura,
+                COALESCE(c.humedad, 70.0) AS humedad,
+                COALESCE(c.precipitacion, 0.0) AS precipitacion,
+                COALESCE(f.total_dias, 1) AS total_dias,
+                COALESCE(f.temporada, 'Media') AS temporada
             FROM ocupacion_hotelera oh
-            LEFT JOIN clima c ON oh.id_clima = c.id_clima
-            LEFT JOIN feriados f ON oh.id_feriado = f.id_feriado
+            LEFT JOIN clima c ON oh.fecha = c.fecha
+            LEFT JOIN feriados f ON oh.fecha BETWEEN f.fecha_inicio AND f.fecha_fin
             WHERE oh.ocupacion_porcentaje IS NOT NULL
             ORDER BY oh.fecha ASC
         """
