@@ -172,34 +172,40 @@ def procesar_ocupacion(df):
     insertados, errores, detalles = 0, 0, []
     
     try:
+        registros_a_insertar = []
         for index, row in df.iterrows():
             try:
                 if pd.isna(row.get('fecha')) or pd.isna(row.get('id_hotel')):
                     errores += 1
-                    detalles.append(f"Fila {int(index) + 1}: Faltan campos requeridos")
+                    if len(detalles) < 10:
+                        detalles.append(f"Fila {int(index) + 1}: Faltan campos requeridos")
                     continue
                 
                 fecha = pd.to_datetime(row['fecha']).strftime('%Y-%m-%d')
-                sql = """
-                INSERT INTO ocupacion_hotelera 
-                (id_hotel, fecha, checkin_nacionales, checkin_extranjeros, 
-                 pernoctaciones, habitaciones_ocupadas, tarifa_cobrada, ocupacion_porcentaje, fecha_registro)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
-                """
-                values = (
+                registros_a_insertar.append((
                     int(row['id_hotel']), fecha,
                     int(row.get('checkin_nacionales', 0) or 0), int(row.get('checkin_extranjeros', 0) or 0),
                     int(row.get('pernoctaciones', 0) or 0), int(row.get('habitaciones_ocupadas', 0) or 0),
                     float(row.get('tarifa_cobrada', 0) or 0), float(row.get('ocupacion_porcentaje', 0) or 0)
-                )
-                cursor.execute(sql, values)
-                insertados += 1
+                ))
             except Exception as e:
                 errores += 1
-                # ✅ AGREGADO: Imprimir el error real en la consola de Python
-                error_msg = f"Fila {int(index) + 1}: {str(e)}"
-                detalles.append(error_msg)
-                print(f"⚠️ ERROR EN FILA {int(index) + 1}: {str(e)}") # <-- ESTO ES CLAVE
+                if len(detalles) < 10:
+                    detalles.append(f"Fila {int(index) + 1}: {str(e)}")
+
+        sql = """
+        INSERT INTO ocupacion_hotelera 
+        (id_hotel, fecha, checkin_nacionales, checkin_extranjeros, 
+         pernoctaciones, habitaciones_ocupadas, tarifa_cobrada, ocupacion_porcentaje, fecha_registro)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
+        """
+        
+        batch_size = 5000
+        for i in range(0, len(registros_a_insertar), batch_size):
+            batch = registros_a_insertar[i:i + batch_size]
+            cursor.executemany(sql, batch)
+            insertados += len(batch)
+
         connection.commit()
     except Exception as e:
         connection.rollback()
@@ -208,6 +214,7 @@ def procesar_ocupacion(df):
         cursor.close()
         connection.close()
     return {'insertados': insertados, 'errores': errores, 'detalles': detalles[:10]}
+
 
 
 def procesar_clima(df):
