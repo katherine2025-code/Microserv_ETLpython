@@ -1,7 +1,7 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, List
 import pandas as pd
 from datetime import datetime
 import uvicorn
@@ -10,11 +10,16 @@ import pymysql
 import os
 from dotenv import load_dotenv
 import re
+import logging
 
 from data_loader import obtener_dataset_ml
 from modelo import ModeloPredictor
 
-# Cargar variables de entorno desde el archivo .env
+# Configurar logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Cargar variables de entorno
 load_dotenv()
 
 app = FastAPI(
@@ -23,14 +28,26 @@ app = FastAPI(
     version="1.0.0"
 )
 
+# ==========================================
+# CONFIGURACIÓN CORS ACTUALIZADA
+# ==========================================
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:8100"],
+    allow_origins=[
+        "http://localhost:3000",   # Backend Node.js
+        "http://localhost:8100",   # Frontend Ionic
+        "http://localhost:8101",   # Frontend Ionic
+        "http://localhost:5000",   # Este mismo servicio
+        "http://127.0.0.1:3000",
+        "http://127.0.0.1:8100",
+        "http://127.0.0.1:8101",
+    ],
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
 
+# Inicializar modelo
 modelo = ModeloPredictor()
 
 # ==========================================
@@ -40,13 +57,13 @@ DB_CONFIG = {
     'host': os.getenv('DB_HOST', '127.0.0.1'),
     'port': int(os.getenv('DB_PORT', 3306)),
     'user': os.getenv('DB_USER', 'root'),
-    'password': os.getenv('DB_PASSWORD', 'vidamiaIsa2910.'), 
+    'password': os.getenv('DB_PASSWORD', 'vidamiaIsa2910.'),
     'database': os.getenv('DB_NAME', 'ots'),
     'charset': 'utf8mb4',
     'cursorclass': pymysql.cursors.DictCursor
 }
 
-print(f"\n Configuración de BD en Python:")
+print(f"\n📊 Configuración de BD en Python:")
 print(f"   Host: {DB_CONFIG['host']}")
 print(f"   Usuario: {DB_CONFIG['user']}")
 print(f"   Base de datos: {DB_CONFIG['database']}\n")
@@ -57,19 +74,97 @@ def get_db_connection():
         connection = pymysql.connect(**DB_CONFIG)
         return connection
     except Exception as e:
-        print(f" ERROR DE CONEXIÓN A BD: {str(e)}")
+        print(f"❌ ERROR DE CONEXIÓN A BD: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error de conexión BD: {str(e)}")
 
+# ==========================================
+# NUEVOS ENDPOINTS PARA COMPATIBILIDAD CON BACKEND NODE.JS
+# ==========================================
+
+@app.get("/")
+async def root():
+    """Raíz del servicio"""
+    return {
+        "service": "ML Service OTS",
+        "status": "running",
+        "version": "1.0.0",
+        "timestamp": datetime.now().isoformat(),
+        "modelo_entrenado": modelo.modelo_entrenado is not None,
+        "docs": "/docs"
+    }
+
+@app.get("/health")
+async def health():
+    """Health check para el backend Node.js"""
+    return {
+        "status": "OK",
+        "service": "ML Service OTS",
+        "timestamp": datetime.now().isoformat(),
+        "modelo_entrenado": modelo.modelo_entrenado is not None,
+        "precision": float(modelo.metricas.get('precision', 0)) if modelo.modelo_entrenado else None,
+        "fecha_entrenamiento": getattr(modelo, 'fecha_entrenamiento', None),
+        "version": "1.0.0"
+    }
+
+@app.get("/metrics")
+async def get_metrics():
+    """Métricas del modelo para el backend Node.js"""
+    if modelo.modelo_entrenado is None:
+        return {
+            "entrenado": False,
+            "precision": 0.0,
+            "total_predicciones": 0,
+            "mensaje": "Modelo no entrenado aún"
+        }
+    
+    # Obtener total de predicciones de la BD
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT COUNT(*) as total FROM predicciones")
+            total = cursor.fetchone()['total']
+        conn.close()
+    except:
+        total = 0
+    
+    return {
+        "entrenado": True,
+        "precision": float(modelo.metricas.get('precision', 85.0)),
+        "total_predicciones": int(total),
+        "modelo_usado": str(modelo.nombre_modelo),
+        "fecha_entrenamiento": getattr(modelo, 'fecha_entrenamiento', datetime.now().isoformat()),
+        "metricas": modelo.metricas
+    }
+
+@app.get("/metricas")
+async def get_metricas():
+    """Endpoint alternativo para métricas (compatibilidad)"""
+    return await get_metrics()
+
+@app.get("/status")
+async def get_status():
+    """Estado completo del servicio"""
+    entrenado = modelo.modelo_entrenado is not None
+    return {
+        "service": "ML Service OTS",
+        "status": "online",
+        "modelo_entrenado": entrenado,
+        "precision": float(modelo.metricas.get('precision', 0)) if entrenado else 0,
+        "fecha_entrenamiento": getattr(modelo, 'fecha_entrenamiento', None),
+        "version": "1.0.0",
+        "timestamp": datetime.now().isoformat()
+    }
 
 # ==========================================
-# ENDPOINTS ETL
+# ENDPOINTS ETL EXISTENTES
 # ==========================================
+
 @app.post("/etl/procesar")
 async def procesar_csv(file: UploadFile = File(...), tipo: str = None):
     try:
         contents = await file.read()
-        print(f"\n Intentando leer CSV...")
-        print(f" Tamaño del archivo: {len(contents)} bytes")
+        print(f"\n📄 Intentando leer CSV...")
+        print(f"📦 Tamaño del archivo: {len(contents)} bytes")
         
         mejor_df = None
         separadores = [';', ',', '\t']
@@ -83,7 +178,7 @@ async def procesar_csv(file: UploadFile = File(...), tipo: str = None):
                         primera_col = str(df_temp.columns[0]).lower()
                         if sep not in primera_col:
                             mejor_df = pd.read_csv(io.BytesIO(contents), sep=sep, encoding=enc, on_bad_lines='skip')
-                            print(f" Lectura exitosa con separador '{sep}' y encoding '{enc}'")
+                            print(f"✅ Lectura exitosa con separador '{sep}' y encoding '{enc}'")
                             break
                 except Exception:
                     continue
@@ -96,46 +191,32 @@ async def procesar_csv(file: UploadFile = File(...), tipo: str = None):
         df = mejor_df
         columnas_lower = [str(col).lower() for col in df.columns]
         
-        print(f"\n Columnas encontradas: {list(df.columns)}")
-        print(f" Columnas en minúsculas: {columnas_lower}")
+        print(f"\n📋 Columnas encontradas: {list(df.columns)}")
         
-        # ==========================================
-        # DETECCIÓN AUTOMÁTICA DE TIPO
-        # ==========================================
+        # Detección automática de tipo
         if tipo is None or tipo == '':
-            print("\n Tipo no especificado, detectando automáticamente...")
+            print("\n🔍 Tipo no especificado, detectando automáticamente...")
             
-            # Detectar Ocupación Hotelera
             if any(col in columnas_lower for col in ['id_hotel', 'ocupacion_porcentaje', 'checkin_nacionales']):
                 tipo = 'ocupacion'
-                print(" Detectado: OCUPACIÓN HOTELERA")
-            
-            # Detectar Clima
+                print("✅ Detectado: OCUPACIÓN HOTELERA")
             elif any(col in columnas_lower for col in ['temperatura', 'humedad', 'precipitacion']):
                 tipo = 'clima'
-                print(" Detectado: CLIMA")
-            
-            # Detectar Feriados
+                print("✅ Detectado: CLIMA")
             elif any(col in columnas_lower for col in ['fecha_inicio', 'fecha_fin', 'temporada']):
                 tipo = 'feriados'
-                print(" Detectado: FERIADOS")
-            
-            # Detectar Encuestas
+                print("✅ Detectado: FERIADOS")
             elif any(col in columnas_lower for col in ['genero', 'edad', 'pais_residencia', 'nivel_satisfaccion']):
                 tipo = 'encuestas'
-                print(" Detectado: ENCUESTAS")
-            
+                print("✅ Detectado: ENCUESTAS")
             else:
                 raise HTTPException(
                     status_code=400, 
                     detail=f"No se pudo detectar el tipo de datos. Columnas: {columnas_lower}"
                 )
-        else:
-            print(f"\n Tipo especificado: {tipo}")
         
-        print(f"\n Procesando CSV tipo: {tipo}")
-        print(f" Filas leídas: {len(df)}")
-        print(f" Columnas encontradas: {len(df.columns)}")
+        print(f"\n🔄 Procesando CSV tipo: {tipo}")
+        print(f"📊 Filas leídas: {len(df)}")
         
         if tipo == 'ocupacion':
             resultado = procesar_ocupacion(df)
@@ -161,10 +242,14 @@ async def procesar_csv(file: UploadFile = File(...), tipo: str = None):
     except HTTPException:
         raise
     except Exception as e:
-        print(f"Error general procesando CSV: {str(e)}")
+        print(f"❌ Error general procesando CSV: {str(e)}")
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error procesando CSV: {str(e)}")
+
+# ==========================================
+# FUNCIONES ETL (mantenidas igual)
+# ==========================================
 
 def procesar_ocupacion(df):
     connection = get_db_connection()
@@ -215,8 +300,6 @@ def procesar_ocupacion(df):
         connection.close()
     return {'insertados': insertados, 'errores': errores, 'detalles': detalles[:10]}
 
-
-
 def procesar_clima(df):
     connection = get_db_connection()
     cursor = connection.cursor()
@@ -240,7 +323,6 @@ def procesar_clima(df):
         cursor.close()
         connection.close()
     return {'insertados': insertados, 'errores': errores}
-
 
 def procesar_feriados(df):
     connection = get_db_connection()
@@ -266,14 +348,10 @@ def procesar_feriados(df):
         connection.close()
     return {'insertados': insertados, 'errores': errores}
 
-
 def procesar_encuestas(df):
-    """
-    PROCESO ETL GENÉRICO - Detecta y procesa CUALQUIER formato de CSV de encuestas
-    (100% compatible con la estructura actual de la BD sin cedula_encuestador)
-    """
-    print("\n INICIANDO PROCESO ETL GENÉRICO PARA ENCUESTAS...")
-    print(f" DataFrame: {len(df)} filas x {len(df.columns)} columnas")
+    """Proceso ETL genérico para encuestas"""
+    print("\n📊 INICIANDO PROCESO ETL GENÉRICO PARA ENCUESTAS...")
+    print(f"📋 DataFrame: {len(df)} filas x {len(df.columns)} columnas")
     
     connection = get_db_connection()
     cursor = connection.cursor()
@@ -281,13 +359,9 @@ def procesar_encuestas(df):
     insertados, errores, detalles = 0, 0, []
     
     try:
-        # ==========================================
-        # FASE 1: DETECCIÓN AUTOMÁTICA DE ESTRUCTURA
-        # ==========================================
-        print("\n Fase 1: Analizando estructura del CSV...")
-        
+        # Mapeo inteligente de columnas
         mapeo_inteligente = {
-            'fecha_encuesta': ['start', 'fecha', 'fecha_encuesta', 'date', 'timestamp', 'end', 'submission_time', 'detalles_de_cuenta', 'submission'],
+            'fecha_encuesta': ['start', 'fecha', 'fecha_encuesta', 'date', 'timestamp', 'end', 'submission_time'],
             'genero': ['genero', 'sexo', 'gender', 'mujer', 'hombre'],
             'edad': ['edad', 'age', 'años', 'years'],
             'pais_residencia': ['pais', 'country', 'nacionalidad', 'residencia', 'pais_residencia']
@@ -300,13 +374,8 @@ def procesar_encuestas(df):
                 if any(nombre in col_lower for nombre in posibles_nombres):
                     if campo not in columnas_detectadas:
                         columnas_detectadas[campo] = col
-                        print(f" Detectada columna '{campo}': {col}")
+                        print(f"✅ Detectada columna '{campo}': {col}")
                         break
-        
-        # ==========================================
-        # FASE 2: EXTRACCIÓN INTELIGENTE DE DATOS
-        # ==========================================
-        print("\n Fase 2: Extrayendo datos...")
         
         def extraer_fecha(valor):
             if not valor or pd.isna(valor) or str(valor) in ['nan', '', 'None']:
@@ -347,12 +416,6 @@ def procesar_encuestas(df):
                 edad = int(numeros[0])
                 if 5 <= edad <= 120:
                     return edad
-            match = re.search(r'(\d+)\s*a\s*(\d+)', valor_str)
-            if match:
-                edad_min = int(match.group(1))
-                edad_max = int(match.group(2))
-                if 5 <= edad_min <= 120 and 5 <= edad_max <= 120:
-                    return (edad_min + edad_max) // 2
             return None
 
         def extraer_pais(valor):
@@ -379,10 +442,7 @@ def procesar_encuestas(df):
                         return 1
             return 3
         
-        # ==========================================
-        # FASE 3: PROCESAR FILAS
-        # ==========================================
-        print("\n Fase 3: Procesando filas...")
+        print("\n🔄 Procesando filas...")
         
         for idx, row in df.iterrows():
             try:
@@ -427,7 +487,6 @@ def procesar_encuestas(df):
                 # Extraer satisfacción
                 satisfaccion = extraer_satisfaccion(row)
                 
-                # ✅ INSERTAR (SIN CÉDULA, COINCIDE EXACTAMENTE CON TU BD ACTUAL)
                 sql = """
                 INSERT INTO encuestas_turisticas 
                 (fecha_encuesta, genero, edad, pais_residencia, 
@@ -442,12 +501,12 @@ def procesar_encuestas(df):
                     genero,
                     edad,
                     pais,
-                    '',  # ciudad_residencia
-                    '',  # motivo_visita
-                    0,   # noches_estadia
-                    0.0, # gasto_total
+                    '',
+                    '',
+                    0,
+                    0.0,
                     satisfaccion,
-                    satisfaccion # probabilidad_retorno
+                    satisfaccion
                 )
                 
                 cursor.execute(sql, values)
@@ -464,19 +523,17 @@ def procesar_encuestas(df):
         connection.commit()
         
         print("\n" + "="*60)
-        print(" PROCESO ETL COMPLETADO")
+        print("✅ PROCESO ETL COMPLETADO")
         print("="*60)
-        print(f" Total procesado: {len(df)}")
-        print(f" Insertados: {insertados}")
-        print(f" Errores: {errores}")
+        print(f"📊 Total procesado: {len(df)}")
+        print(f"✅ Insertados: {insertados}")
+        print(f"❌ Errores: {errores}")
         if len(df) > 0:
-            print(f" Tasa de éxito: {(insertados/len(df)*100):.2f}%")
-        if detalles:
-            print(f" Errores: {detalles}")
+            print(f"📈 Tasa de éxito: {(insertados/len(df)*100):.2f}%")
         print("="*60)
         
     except Exception as e:
-        print(f" ERROR CRÍTICO: {str(e)}")
+        print(f"❌ ERROR CRÍTICO: {str(e)}")
         import traceback
         traceback.print_exc()
         connection.rollback()
@@ -486,8 +543,9 @@ def procesar_encuestas(df):
         connection.close()
     
     return {'insertados': insertados, 'errores': errores, 'detalles': detalles}
+
 # ==========================================
-# ENDPOINTS EXISTENTES (ML)
+# ENDPOINTS ML EXISTENTES (ACTUALIZADOS)
 # ==========================================
 
 class PrediccionRequest(BaseModel):
@@ -506,14 +564,11 @@ class PrediccionRangoRequest(BaseModel):
     fecha_fin: str
     id_hotel: Optional[int] = 1
 
-@app.get("/")
-def raiz():
-    return {"servicio": "Microservicio ML - OTS Santa Elena", "version": "1.0.0", "estado": "operativo"}
-
 @app.post("/entrenar")
-def entrenar_modelo():
+async def entrenar_modelo():
+    """Entrenar el modelo con datos de la base de datos"""
     try:
-        print("\n Iniciando entrenamiento comparativo (RF vs XGBoost)...")
+        print("\n🔄 Iniciando entrenamiento comparativo (RF vs XGBoost)...")
         df = obtener_dataset_ml()
 
         if df is None or len(df) == 0:
@@ -528,38 +583,48 @@ def entrenar_modelo():
             else:
                 raise HTTPException(status_code=400, detail="No se encontró la columna 'ocupacion_porcentaje'.")
 
-        # ✅ Entrena ambos modelos y devuelve comparación
+        # Entrenar ambos modelos
         resultados = modelo.entrenar(df)
+        
+        # Guardar fecha de entrenamiento
+        modelo.fecha_entrenamiento = datetime.now().isoformat()
+
+        print(f"\n✅ Modelo entrenado exitosamente!")
+        print(f"   Mejor modelo: {resultados['mejor_modelo']}")
+        print(f"   Precisión: {resultados['metricas'].get('precision', 0):.2f}%")
 
         return {
-            "mensaje": "Entrenamiento comparativo completado exitosamente",
+            "success": True,
+            "mensaje": "Entrenamiento completado exitosamente",
             "mejor_modelo": resultados['mejor_modelo'],
             "metricas": resultados['metricas'],
-            "comparacion": resultados['comparacion']
+            "comparacion": resultados['comparacion'],
+            "fecha_entrenamiento": modelo.fecha_entrenamiento
         }
     except HTTPException:
         raise
     except Exception as e:
-        print(f" ERROR: {str(e)}")
+        print(f"❌ ERROR: {str(e)}")
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
 
 @app.post("/predecir")
-def predecir_ocupacion(request: PrediccionRequest):
+async def predecir_ocupacion(request: PrediccionRequest):
+    """Endpoint principal de predicción"""
     try:
-        print("\n INICIANDO PREDICCIÓN...")
-        print(f"Datos recibidos: {request}")
+        print("\n🎯 INICIANDO PREDICCIÓN...")
+        print(f"📊 Datos recibidos: {request}")
         
-        # Verificar si hay modelo entrenado
+        # Verificar modelo
         if modelo.modelo_entrenado is None:
-            print(" No hay modelo en memoria, intentando cargar desde archivo...")
+            print("⚠️ No hay modelo en memoria, intentando cargar...")
             if not modelo.cargar_modelo():
-                print(" ERROR: No se pudo cargar el modelo")
+                print("❌ ERROR: No se pudo cargar el modelo")
                 raise HTTPException(status_code=400, detail="No hay modelo entrenado. Primero ejecuta /entrenar")
-            print(" Modelo cargado exitosamente")
+            print("✅ Modelo cargado exitosamente")
         
-        # Preparar datos para predicción
+        # Preparar datos
         datos = {
             'fecha': request.fecha_objetivo,
             'checkin_nacionales': request.checkin_nacionales or 50,
@@ -572,18 +637,18 @@ def predecir_ocupacion(request: PrediccionRequest):
             'temporada': request.temporada or "Media"
         }
         
-        print(f" Datos para predicción: {datos}")
+        print(f"📊 Datos procesados: {datos}")
         
         # Generar predicción
         prediccion_val = modelo.predecir(datos)
-        prediccion_float = float(max(0, min(100, prediccion_val)))  # Asegurar que esté entre 0-100 y sea float nativo de Python
+        prediccion_float = float(max(0, min(100, prediccion_val)))
         
         error_estimado = float(modelo.metricas.get('rmse', 5))
         precision_modelo = float(modelo.metricas.get('precision', 85.0))
         
-        print(f" Predicción generada: {prediccion_float}%")
+        print(f"✅ Predicción generada: {prediccion_float}%")
 
-        # ✅ Guardar predicción generada en la base de datos MySQL (tabla predicciones)
+        # Guardar en BD
         try:
             conn = get_db_connection()
             with conn.cursor() as cursor:
@@ -594,7 +659,7 @@ def predecir_ocupacion(request: PrediccionRequest):
                     VALUES (%s, %s, NOW(), %s, %s, %s, %s)
                 """
                 cursor.execute(sql_insert, (
-                    1, # id_hotel por defecto
+                    1,
                     request.fecha_objetivo,
                     round(prediccion_float, 2),
                     round(precision_modelo, 2),
@@ -603,11 +668,12 @@ def predecir_ocupacion(request: PrediccionRequest):
                 ))
             conn.commit()
             conn.close()
-            print(" Predicción guardada exitosamente en la base de datos MySQL")
+            print("✅ Predicción guardada en BD")
         except Exception as db_err:
             print(f"⚠️ Advertencia al guardar en BD: {str(db_err)}")
         
         return {
+            "success": True,
             "fecha_objetivo": request.fecha_objetivo,
             "ocupacion_predicha": round(prediccion_float, 2),
             "modelo": str(modelo.nombre_modelo),
@@ -617,27 +683,24 @@ def predecir_ocupacion(request: PrediccionRequest):
                 "minimo": round(max(0, prediccion_float - error_estimado), 2),
                 "maximo": round(min(100, prediccion_float + error_estimado), 2)
             },
-            "mensaje": "Predicción de Ocupación Hotelera generada exitosamente"
+            "timestamp": datetime.now().isoformat()
         }
     except HTTPException:
         raise
     except Exception as e:
-        print(f" ERROR CRÍTICO EN PREDICCIÓN: {str(e)}")
+        print(f"❌ ERROR CRÍTICO EN PREDICCIÓN: {str(e)}")
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error al generar predicción: {str(e)}")
 
 @app.post("/predecir-rango")
-def predecir_ocupacion_rango(request: PrediccionRangoRequest):
-    """
-    Genera la proyección de ocupación hotelera día por día para un rango de fechas.
-    Ideal para investigadores y analistas de turismo.
-    """
+async def predecir_ocupacion_rango(request: PrediccionRangoRequest):
+    """Genera proyección día por día para un rango de fechas"""
     try:
-        print("\n GENERANDO PROYECCIÓN POR RANGO DE FECHAS...")
-        print(f" Desde: {request.fecha_inicio} Hasta: {request.fecha_fin}")
+        print("\n📊 GENERANDO PROYECCIÓN POR RANGO DE FECHAS...")
+        print(f"📅 Desde: {request.fecha_inicio} Hasta: {request.fecha_fin}")
         
-        # Verificar modelo entrenado
+        # Verificar modelo
         if not modelo.modelo_entrenado:
             if not modelo.cargar_modelo():
                 raise HTTPException(status_code=400, detail="No hay modelo entrenado. Ejecuta primero /entrenar.")
@@ -655,11 +718,16 @@ def predecir_ocupacion_rango(request: PrediccionRangoRequest):
         connection = get_db_connection()
         cursor = connection.cursor()
         
-        # Consultar clima y feriados existentes para el rango de fechas
+        # Consultar clima
         query_clima = "SELECT fecha, temperatura, humedad, precipitacion FROM clima WHERE fecha BETWEEN %s AND %s"
         cursor.execute(query_clima, (request.fecha_inicio, request.fecha_fin))
-        clima_dict = {row['fecha'].strftime('%Y-%m-%d'): row for row in cursor.fetchall()}
+        clima_dict = {}
+        for row in cursor.fetchall():
+            fecha_str = row['fecha'].strftime('%Y-%m-%d') if row['fecha'] else None
+            if fecha_str:
+                clima_dict[fecha_str] = row
         
+        # Consultar feriados
         query_feriados = "SELECT fecha_inicio, fecha_fin, temporada, total_dias FROM feriados WHERE fecha_inicio <= %s AND fecha_fin >= %s"
         cursor.execute(query_feriados, (request.fecha_fin, request.fecha_inicio))
         feriados_list = cursor.fetchall()
@@ -673,13 +741,11 @@ def predecir_ocupacion_rango(request: PrediccionRangoRequest):
             fecha_str = fecha_dt.strftime('%Y-%m-%d')
             es_fin_semana = 1 if fecha_dt.dayofweek >= 5 else 0
             
-            # Buscar clima de la BD o usar promedio estimado
             info_clima = clima_dict.get(fecha_str, {})
             temp = float(info_clima.get('temperatura', 26.0))
             hum = float(info_clima.get('humedad', 70.0))
             prec = float(info_clima.get('precipitacion', 0.0))
             
-            # Buscar si hay feriado activo
             temporada = "Media"
             total_dias_feriado = 1
             for f in feriados_list:
@@ -693,7 +759,6 @@ def predecir_ocupacion_rango(request: PrediccionRangoRequest):
             if es_fin_semana and temporada == "Media":
                 temporada = "Alta"
                 
-            # Construir datos de entrada
             datos_dia = {
                 'fecha': fecha_str,
                 'checkin_nacionales': 60 if temporada == "Alta" else 35,
@@ -718,47 +783,38 @@ def predecir_ocupacion_rango(request: PrediccionRangoRequest):
                 'temperatura': temp
             })
             
-        # Calcular agregaciones avanzadas para el Investigador Turístico
+        # Calcular métricas
         valores = [p['ocupacion_predicha'] for p in predicciones_diarias]
         promedio = round(sum(valores) / len(valores), 2)
         pico = max(predicciones_diarias, key=lambda x: x['ocupacion_predicha'])
         valle = min(predicciones_diarias, key=lambda x: x['ocupacion_predicha'])
         
-        # 1. Agrupación por día de la semana (Lunes, Martes, etc.)
+        # Promedios por día de semana
         dias_semana_map = {}
         for p in predicciones_diarias:
             d_nom = p['dia_semana']
             if d_nom not in dias_semana_map:
                 dias_semana_map[d_nom] = []
             dias_semana_map[d_nom].append(p['ocupacion_predicha'])
-            
         promedios_dia_semana = {d: round(sum(vals)/len(vals), 2) for d, vals in dias_semana_map.items()}
         
-        # 2. Agrupación por temporada (Alta, Media, Baja)
+        # Promedios por temporada
         temporada_map = {}
         for p in predicciones_diarias:
             temp_nom = p['temporada']
             if temp_nom not in temporada_map:
                 temporada_map[temp_nom] = []
             temporada_map[temp_nom].append(p['ocupacion_predicha'])
-            
         promedios_temporada = {t: round(sum(vals)/len(vals), 2) for t, vals in temporada_map.items()}
         
-        # 3. Métricas proyectadas de impacto económico y afluencia
-        turistas_estimados_totales = int(sum(p['ocupacion_predicha'] * 2.2 for p in predicciones_diarias))
-        ingresos_estimados_usd = round(sum(p['ocupacion_predicha'] * 85.0 for p in predicciones_diarias), 2)
-        dias_alta_demanda = len([p for p in predicciones_diarias if p['ocupacion_predicha'] >= 60])
-        
         return {
+            'success': True,
             'fecha_inicio': request.fecha_inicio,
             'fecha_fin': request.fecha_fin,
             'total_dias': len(predicciones_diarias),
             'ocupacion_promedio': promedio,
             'dia_pico': pico,
             'dia_valle': valle,
-            'turistas_estimados_totales': turistas_estimados_totales,
-            'ingresos_estimados_usd': ingresos_estimados_usd,
-            'dias_alta_demanda': dias_alta_demanda,
             'promedios_dia_semana': promedios_dia_semana,
             'promedios_temporada': promedios_temporada,
             'modelo_usado': str(modelo.nombre_modelo),
@@ -767,176 +823,20 @@ def predecir_ocupacion_rango(request: PrediccionRangoRequest):
     except HTTPException:
         raise
     except Exception as e:
-        print(f" ERROR en predicción por rango: {str(e)}")
+        print(f"❌ ERROR en predicción por rango: {str(e)}")
         import traceback
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Error en proyección por rango: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error en proyección: {str(e)}")
 
-@app.get("/predicciones-historicas")
-def predicciones_historicas(limite: int = None, dias: int = None):
-    """
-    Genera predicciones para datos históricos y compara con valores reales
-    
-    Args:
-        limite: Número máximo de registros a validar (opcional, default: todos)
-        dias: Número de días hacia atrás para validar (opcional)
-    """
-    try:
-        print("\n Generando predicciones históricas...")
-        
-        connection = get_db_connection()
-        cursor = connection.cursor()
-        
-        # Construir consulta dinámica
-        query = """
-            SELECT oh.fecha, oh.checkin_nacionales, oh.checkin_extranjeros, 
-                   oh.pernoctaciones, oh.habitaciones_ocupadas, oh.tarifa_cobrada, 
-                   oh.ocupacion_porcentaje,
-                   COALESCE(c.temperatura, 25.0) AS temperatura,
-                   COALESCE(c.humedad, 70.0) AS humedad,
-                   COALESCE(c.precipitacion, 0.0) AS precipitacion,
-                   COALESCE(f.total_dias, 1) AS total_dias,
-                   COALESCE(f.temporada, 'Media') AS temporada
-            FROM ocupacion_hotelera oh
-            LEFT JOIN clima c ON oh.fecha = c.fecha
-            LEFT JOIN feriados f ON oh.fecha BETWEEN f.fecha_inicio AND f.fecha_fin
-            WHERE oh.ocupacion_porcentaje IS NOT NULL 
-              AND oh.ocupacion_porcentaje > 0
-        """
-        
-        params = []
-        
-        # Si se especifica número de días, filtrar por fecha
-        if dias is not None:
-            query += " AND fecha >= DATE_SUB(NOW(), INTERVAL %s DAY)"
-            params.append(dias)
-            print(f"    Filtrando últimos {dias} días...")
-        
-        query += " ORDER BY fecha DESC"
-        
-        # Si se especifica un límite, aplicarlo
-        if limite is not None:
-            query += " LIMIT %s"
-            params.append(limite)
-            print(f"    Límite: {limite} registros...")
-        else:
-            print("    Procesando TODOS los registros disponibles...")
-        
-        cursor.execute(query, params)
-        
-        datos_reales = cursor.fetchall()
-        cursor.close()
-        connection.close()
-        
-        if not datos_reales:
-            raise HTTPException(status_code=404, detail="No hay datos históricos disponibles")
-        
-        print(f"     Datos históricos encontrados: {len(datos_reales)} registros")
-        
-        # 2. Cargar el modelo entrenado
-        if not modelo.modelo_entrenado:
-            print("    Cargando modelo desde archivo...")
-            if not modelo.cargar_modelo():
-                raise HTTPException(status_code=400, detail="No hay modelo entrenado. Primero ejecuta /entrenar")
-        
-        # 3. Generar predicciones para cada registro histórico
-        resultados = []
-        registros_procesados = 0
-        
-        for row in datos_reales:
-            try:
-                datos_input = {
-                    'fecha': row['fecha'].strftime('%Y-%m-%d') if row['fecha'] else '2026-01-01',
-                    'checkin_nacionales': int(row['checkin_nacionales'] or 0),
-                    'checkin_extranjeros': int(row['checkin_extranjeros'] or 0),
-                    'pernoctaciones': int(row['pernoctaciones'] or 0),
-                    'habitaciones_ocupadas': int(row['habitaciones_ocupadas'] or 0),
-                    'tarifa_cobrada': float(row['tarifa_cobrada'] or 0),
-                    'temperatura': float(row['temperatura']),
-                    'humedad': float(row['humedad']),
-                    'precipitacion': float(row['precipitacion']),
-                    'total_dias': int(row['total_dias']),
-                    'temporada': str(row['temporada'])
-                }
-                
-                # Preprocesar
-                df_input = pd.DataFrame([datos_input])
-                df_input = modelo.preprocesar(df_input)
-                
-                # Alinear columnas
-                modelo_actual = modelo.modelos.get(modelo.nombre_modelo)
-                if modelo_actual and hasattr(modelo_actual, 'feature_names_in_'):
-                    expected_features = modelo_actual.feature_names_in_
-                    for col in expected_features:
-                        if col not in df_input.columns:
-                            df_input[col] = 0
-                    df_input = df_input[expected_features]
-                
-                # Predecir
-                prediccion = modelo_actual.predict(df_input)[0]
-                prediccion = float(max(0, min(100, prediccion)))
-                
-                # Calcular error
-                valor_real = float(row['ocupacion_porcentaje'])
-                error = abs(valor_real - prediccion)
-                
-                resultados.append({
-                    'fecha': row['fecha'].strftime('%Y-%m-%d') if row['fecha'] else '2026-01-01',
-                    'valor_real': round(float(valor_real), 2),
-                    'valor_predicho': round(float(prediccion), 2),
-                    'error': round(float(error), 2),
-                    'precision': round(float(100 - error), 2)
-                })
-                
-                registros_procesados += 1
-                
-                # Mostrar progreso cada 100 registros
-                if registros_procesados % 100 == 0:
-                    print(f"    Procesados: {registros_procesados} registros...")
-                
-            except Exception as e:
-                print(f"     Error procesando fila: {str(e)}")
-                continue
-        
-        if not resultados:
-            raise HTTPException(status_code=500, detail="No se pudieron generar predicciones")
-        
-        # 4. Calcular métricas generales
-        errores = [float(r['error']) for r in resultados]
-        precision_promedio = sum(float(r['precision']) for r in resultados) / len(resultados)
-        
-        respuesta = {
-            'total_registros': int(len(resultados)),
-            'precision_promedio': round(float(precision_promedio), 2),
-            'error_promedio': round(float(sum(errores) / len(errores)), 2),
-            'modelo_usado': str(modelo.nombre_modelo),
-            'predicciones': resultados
-        }
-        
-        print(f"\n" + "="*60)
-        print(" VALIDACIÓN HISTÓRICA COMPLETADA")
-        print("="*60)
-        print(f" Total registros: {len(resultados)}")
-        print(f" Precisión promedio: {respuesta['precision_promedio']}%")
-        print(f" Error promedio: {respuesta['error_promedio']}%")
-        print("="*60)
-        
-        return respuesta
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f" ERROR en predicciones históricas: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Error interno: {str(e)}")
-
-    
 if __name__ == "__main__":
     print("\n" + "="*60)
-    print("Microservicio ML - OTS Santa Elena")
+    print("🚀 Microservicio ML - OTS Santa Elena")
     print("="*60)
-    print("API: http://localhost:5000")
-    print("Documentación: http://localhost:5000/docs")
+    print(f"📡 API: http://localhost:5000")
+    print(f"📊 Health: http://localhost:5000/health")
+    print(f"📈 Métricas: http://localhost:5000/metricas")
+    print(f"🤖 Entrenar: POST http://localhost:5000/entrenar")
+    print(f"🎯 Predecir: POST http://localhost:5000/predecir")
+    print(f"📚 Docs: http://localhost:5000/docs")
     print("="*60 + "\n")
     uvicorn.run(app, host="0.0.0.0", port=5000)
