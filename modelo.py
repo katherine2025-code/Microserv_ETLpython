@@ -34,11 +34,18 @@ class ModeloPredictor:
         data = df.copy()
 
         # 1. Manejo de fechas
+        # 'mes' y 'dia_semana' llegan normalmente ya calculados desde
+        # variables_estacionales (ver data_loader.py y app.py /predecir), para
+        # que entrenamiento y predicción usen exactamente los mismos valores.
+        # Si no vinieran (p.ej. un DataFrame armado a mano), se calculan aquí
+        # con la misma convención: 0=Domingo ... 6=Sábado.
         if 'fecha' in data.columns:
             data['fecha'] = pd.to_datetime(data['fecha'], errors='coerce')
-            data['mes'] = data['fecha'].dt.month
-            data['dia_semana'] = data['fecha'].dt.dayofweek
-            data['es_fin_semana'] = data['dia_semana'].apply(lambda x: 1 if x >= 5 else 0)
+            if 'mes' not in data.columns:
+                data['mes'] = data['fecha'].dt.month
+            if 'dia_semana' not in data.columns:
+                data['dia_semana'] = data['fecha'].dt.dayofweek.apply(lambda d: (d + 1) % 7)
+            data['es_fin_semana'] = data['dia_semana'].apply(lambda x: 1 if x in (0, 6) else 0)
             data.drop(columns=['fecha'], inplace=True)
 
         # 2. Codificar variables categóricas

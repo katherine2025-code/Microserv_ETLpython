@@ -1,19 +1,20 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List
 import pandas as pd
 from datetime import datetime
 import uvicorn
-import io
 import pymysql
 import os
 from dotenv import load_dotenv
-import re
 import logging
 
 from data_loader import obtener_dataset_ml
 from modelo import ModeloPredictor
+from etl_utils import CANONICAL_SCHEMAS, leer_archivo, mapear_posicional, limpiar_y_convertir
+from variables_estacionales import generar_variables_estacionales, obtener_o_generar
+from kobo_establecimientos import es_formulario_establecimientos, procesar_establecimientos
 
 # Configurar logging
 logging.basicConfig(level=logging.INFO)
@@ -160,138 +161,137 @@ async def get_status():
 # ==========================================
 
 @app.post("/etl/procesar")
-async def procesar_csv(file: UploadFile = File(...), tipo: str = None):
+async def procesar_csv(file: UploadFile = File(...), tipo: str = Form(None)):
+    if not tipo or tipo not in CANONICAL_SCHEMAS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Debes indicar un 'tipo' válido: {', '.join(CANONICAL_SCHEMAS.keys())}"
+        )
+
     try:
         contents = await file.read()
-        print(f"\n📄 Intentando leer CSV...")
-        print(f"📦 Tamaño del archivo: {len(contents)} bytes")
-        
-        mejor_df = None
-        separadores = [';', ',', '\t']
-        encodings = ['utf-8', 'latin-1']
-        
-        for sep in separadores:
-            for enc in encodings:
-                try:
-                    df_temp = pd.read_csv(io.BytesIO(contents), sep=sep, encoding=enc, on_bad_lines='skip', nrows=5)
-                    if df_temp is not None and len(df_temp.columns) > 1:
-                        primera_col = str(df_temp.columns[0]).lower()
-                        if sep not in primera_col:
-                            mejor_df = pd.read_csv(io.BytesIO(contents), sep=sep, encoding=enc, on_bad_lines='skip')
-                            print(f"✅ Lectura exitosa con separador '{sep}' y encoding '{enc}'")
-                            break
-                except Exception:
-                    continue
-            if mejor_df is not None:
-                break
-                
-        if mejor_df is None:
-            raise HTTPException(status_code=400, detail="No se pudo leer el CSV. Verifica que sea un archivo válido.")
-        
-        df = mejor_df
-        columnas_lower = [str(col).lower() for col in df.columns]
-        
-        print(f"\n📋 Columnas encontradas: {list(df.columns)}")
-        
-        # Detección automática de tipo
-        if tipo is None or tipo == '':
-            print("\n🔍 Tipo no especificado, detectando automáticamente...")
-            
-            if any(col in columnas_lower for col in ['id_hotel', 'ocupacion_porcentaje', 'checkin_nacionales']):
-                tipo = 'ocupacion'
-                print("✅ Detectado: OCUPACIÓN HOTELERA")
-            elif any(col in columnas_lower for col in ['temperatura', 'humedad', 'precipitacion']):
-                tipo = 'clima'
-                print("✅ Detectado: CLIMA")
-            elif any(col in columnas_lower for col in ['fecha_inicio', 'fecha_fin', 'temporada']):
-                tipo = 'feriados'
-                print("✅ Detectado: FERIADOS")
-            elif any(col in columnas_lower for col in ['genero', 'edad', 'pais_residencia', 'nivel_satisfaccion']):
-                tipo = 'encuestas'
-                print("✅ Detectado: ENCUESTAS")
-            else:
-                raise HTTPException(
-                    status_code=400, 
-                    detail=f"No se pudo detectar el tipo de datos. Columnas: {columnas_lower}"
-                )
-        
-        print(f"\n🔄 Procesando CSV tipo: {tipo}")
-        print(f"📊 Filas leídas: {len(df)}")
-        
-        if tipo == 'ocupacion':
-            resultado = procesar_ocupacion(df)
-        elif tipo == 'clima':
-            resultado = procesar_clima(df)
-        elif tipo == 'feriados':
-            resultado = procesar_feriados(df)
-        elif tipo == 'encuestas':
-            resultado = procesar_encuestas(df)
+        print(f"\n📄 Archivo recibido: {file.filename} ({len(contents)} bytes) - tipo: {tipo}")
+
+        try:
+            df_crudo = leer_archivo(file.filename, contents)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+        if df_crudo.empty:
+            raise HTTPException(status_code=400, detail="El archivo no contiene filas de datos.")
+
+        print(f"📋 Columnas recibidas: {len(df_crudo.columns)} | Filas: {len(df_crudo)}")
+
+        # El formulario Kobo "Establecimientos de Alojamiento" tiene su propia
+        # estructura (grupo repetido de hasta 5 registros por envío, sin
+        # id_hotel) y se procesa aparte - ver kobo_establecimientos.py.
+        if tipo == 'ocupacion' and es_formulario_establecimientos(df_crudo.columns):
+            print("📋 Formulario detectado: Establecimientos de Alojamiento (Kobo)")
+            resultado = procesar_establecimientos(df_crudo, get_db_connection)
+            advertencias = resultado.get('advertencias', [])
+            total_registros = len(df_crudo)
         else:
-            raise HTTPException(status_code=400, detail=f"Tipo no soportado: {tipo}")
-        
+            # Mapeo POSICIONAL genérico: se ignoran los encabezados del
+            # archivo y se usa el orden fijo de columnas esperado para este
+            # tipo (ver etl_utils) - para archivos simples de otras fuentes.
+            df_mapeado, advertencias_version = mapear_posicional(df_crudo, tipo)
+
+            # Normalización de texto, conversión de tipos y relleno de nulos
+            # (numéricos -> 0; texto libre de encuestas -> 'Prefiero no responder').
+            df_limpio, advertencias_datos = limpiar_y_convertir(df_mapeado, tipo)
+
+            advertencias = advertencias_version + advertencias_datos
+            for a in advertencias:
+                print(f"⚠️ {a}")
+
+            print(f"\n🔄 Procesando archivo tipo: {tipo}")
+
+            if tipo == 'ocupacion':
+                resultado = procesar_ocupacion(df_limpio)
+            elif tipo == 'clima':
+                resultado = procesar_clima(df_limpio)
+            elif tipo == 'feriados':
+                resultado = procesar_feriados(df_limpio)
+            elif tipo == 'encuestas':
+                resultado = procesar_encuestas(df_limpio)
+
+            total_registros = len(df_limpio)
+
         return {
             "success": True,
-            "mensaje": "CSV procesado exitosamente",
+            "mensaje": "Archivo procesado exitosamente",
             "tipo": tipo,
-            "total_registros": len(df),
+            "total_registros": total_registros,
             "registros_insertados": resultado['insertados'],
             "registros_error": resultado['errores'],
+            "advertencias": advertencias[:10],
             "detalles": resultado.get('detalles', [])[:10]
         }
-        
+
     except HTTPException:
         raise
     except Exception as e:
-        print(f"❌ Error general procesando CSV: {str(e)}")
+        print(f"❌ Error general procesando archivo: {str(e)}")
         import traceback
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Error procesando CSV: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error procesando archivo: {str(e)}")
 
 # ==========================================
 # FUNCIONES ETL (mantenidas igual)
 # ==========================================
 
 def procesar_ocupacion(df):
+    """Inserta ocupación hotelera. `df` ya viene con columnas canónicas
+    (fecha, id_hotel, ...), tipos convertidos y nulos numéricos en 0
+    (ver etl_utils.limpiar_y_convertir)."""
     connection = get_db_connection()
     cursor = connection.cursor()
     insertados, errores, detalles = 0, 0, []
-    
+
     try:
         registros_a_insertar = []
         for index, row in df.iterrows():
-            try:
-                if pd.isna(row.get('fecha')) or pd.isna(row.get('id_hotel')):
-                    errores += 1
-                    if len(detalles) < 10:
-                        detalles.append(f"Fila {int(index) + 1}: Faltan campos requeridos")
-                    continue
-                
-                fecha = pd.to_datetime(row['fecha']).strftime('%Y-%m-%d')
-                registros_a_insertar.append((
-                    int(row['id_hotel']), fecha,
-                    int(row.get('checkin_nacionales', 0) or 0), int(row.get('checkin_extranjeros', 0) or 0),
-                    int(row.get('pernoctaciones', 0) or 0), int(row.get('habitaciones_ocupadas', 0) or 0),
-                    float(row.get('tarifa_cobrada', 0) or 0), float(row.get('ocupacion_porcentaje', 0) or 0)
-                ))
-            except Exception as e:
+            if not row['fecha'] or row['id_hotel'] is None:
                 errores += 1
                 if len(detalles) < 10:
-                    detalles.append(f"Fila {int(index) + 1}: {str(e)}")
+                    detalles.append(f"Fila {int(index) + 1}: falta 'fecha' o 'id_hotel' (campos obligatorios)")
+                continue
+
+            registros_a_insertar.append((
+                int(row['id_hotel']), row['fecha'],
+                int(row['checkin_nacionales']), int(row['checkin_extranjeros']),
+                int(row['pernoctaciones']), int(row['habitaciones_ocupadas']),
+                float(row['tarifa_cobrada']), float(row['ocupacion_porcentaje'])
+            ))
 
         sql = """
-        INSERT INTO ocupacion_hotelera 
-        (id_hotel, fecha, checkin_nacionales, checkin_extranjeros, 
-         pernoctaciones, habitaciones_ocupadas, tarifa_cobrada, ocupacion_porcentaje, fecha_registro)
+        INSERT INTO ocupacion_hotelera
+        (id_hotel, fecha, checkin_nacionales, checkin_extranjeros,
+         pernoctaciones, habitaciones_ocupadas, tarifa_cobrada, ocupacion_porcentaje, created_at)
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
         """
-        
+
         batch_size = 5000
         for i in range(0, len(registros_a_insertar), batch_size):
             batch = registros_a_insertar[i:i + batch_size]
-            cursor.executemany(sql, batch)
-            insertados += len(batch)
-
-        connection.commit()
+            try:
+                cursor.executemany(sql, batch)
+                connection.commit()
+                insertados += len(batch)
+            except Exception as e:
+                # Si el lote falla (p.ej. id_hotel inexistente por FK), se
+                # reintenta fila por fila para no perder el resto del lote.
+                connection.rollback()
+                for fila in batch:
+                    try:
+                        cursor.execute(sql, fila)
+                        connection.commit()
+                        insertados += 1
+                    except Exception as fila_err:
+                        connection.rollback()
+                        errores += 1
+                        if len(detalles) < 10:
+                            detalles.append(f"id_hotel {fila[0]}, fecha {fila[1]}: {str(fila_err)[:120]}")
     except Exception as e:
         connection.rollback()
         raise e
@@ -300,21 +300,28 @@ def procesar_ocupacion(df):
         connection.close()
     return {'insertados': insertados, 'errores': errores, 'detalles': detalles[:10]}
 
+
 def procesar_clima(df):
     connection = get_db_connection()
     cursor = connection.cursor()
-    insertados, errores = 0, 0
+    insertados, errores, detalles = 0, 0, []
     try:
+        sql = """INSERT INTO clima (fecha, temperatura, humedad, precipitacion, velocidad_viento, descripcion, fecha_registro)
+                 VALUES (%s, %s, %s, %s, %s, %s, NOW())"""
         for index, row in df.iterrows():
-            try:
-                fecha = pd.to_datetime(row['fecha']).strftime('%Y-%m-%d')
-                sql = """INSERT INTO clima (fecha, temperatura, humedad, precipitacion, velocidad_viento, descripcion, fecha_registro)
-                         VALUES (%s, %s, %s, %s, %s, %s, NOW())"""
-                cursor.execute(sql, (fecha, float(row.get('temperatura', 0) or 0), float(row.get('humedad', 0) or 0),
-                                   float(row.get('precipitacion', 0) or 0), float(row.get('velocidad_viento', 0) or 0), str(row.get('descripcion', ''))))
-                insertados += 1
-            except Exception:
+            if not row['fecha']:
                 errores += 1
+                if len(detalles) < 10:
+                    detalles.append(f"Fila {int(index) + 1}: falta 'fecha' (campo obligatorio)")
+                continue
+            try:
+                cursor.execute(sql, (row['fecha'], row['temperatura'], row['humedad'],
+                                      row['precipitacion'], row['velocidad_viento'], row['descripcion'] or ''))
+                insertados += 1
+            except Exception as e:
+                errores += 1
+                if len(detalles) < 10:
+                    detalles.append(f"Fila {int(index) + 1}: {str(e)[:120]}")
         connection.commit()
     except Exception as e:
         connection.rollback()
@@ -322,226 +329,80 @@ def procesar_clima(df):
     finally:
         cursor.close()
         connection.close()
-    return {'insertados': insertados, 'errores': errores}
+    return {'insertados': insertados, 'errores': errores, 'detalles': detalles}
+
 
 def procesar_feriados(df):
     connection = get_db_connection()
     cursor = connection.cursor()
-    insertados, errores = 0, 0
-    try:
-        for index, row in df.iterrows():
-            try:
-                sql = """INSERT INTO feriados (nombre, fecha_inicio, fecha_fin, total_dias, temporada, descripcion, fecha_registro)
-                         VALUES (%s, %s, %s, %s, %s, %s, NOW())"""
-                cursor.execute(sql, (str(row.get('nombre', '')), pd.to_datetime(row['fecha_inicio']).strftime('%Y-%m-%d'),
-                                   pd.to_datetime(row['fecha_fin']).strftime('%Y-%m-%d'), int(row.get('total_dias', 1) or 1),
-                                   str(row.get('temporada', 'Media')), str(row.get('descripcion', ''))))
-                insertados += 1
-            except Exception:
-                errores += 1
-        connection.commit()
-    except Exception as e:
-        connection.rollback()
-        raise e
-    finally:
-        cursor.close()
-        connection.close()
-    return {'insertados': insertados, 'errores': errores}
-
-def procesar_encuestas(df):
-    """Proceso ETL genérico para encuestas"""
-    print("\n📊 INICIANDO PROCESO ETL GENÉRICO PARA ENCUESTAS...")
-    print(f"📋 DataFrame: {len(df)} filas x {len(df.columns)} columnas")
-    
-    connection = get_db_connection()
-    cursor = connection.cursor()
-    
     insertados, errores, detalles = 0, 0, []
-    
     try:
-        # Mapeo inteligente de columnas
-        mapeo_inteligente = {
-            'fecha_encuesta': ['start', 'fecha', 'fecha_encuesta', 'date', 'timestamp', 'end', 'submission_time'],
-            'genero': ['genero', 'sexo', 'gender', 'mujer', 'hombre'],
-            'edad': ['edad', 'age', 'años', 'years'],
-            'pais_residencia': ['pais', 'country', 'nacionalidad', 'residencia', 'pais_residencia']
-        }
-        
-        columnas_detectadas = {}
-        for col in df.columns:
-            col_lower = str(col).lower()
-            for campo, posibles_nombres in mapeo_inteligente.items():
-                if any(nombre in col_lower for nombre in posibles_nombres):
-                    if campo not in columnas_detectadas:
-                        columnas_detectadas[campo] = col
-                        print(f"✅ Detectada columna '{campo}': {col}")
-                        break
-        
-        def extraer_fecha(valor):
-            if not valor or pd.isna(valor) or str(valor) in ['nan', '', 'None']:
-                return None
-            valor_str = str(valor).strip()
-            formatos = ['%d/%m/%Y %H:%M', '%d/%m/%Y', '%m/%d/%Y', '%Y-%m-%d %H:%M:%S', '%Y-%m-%d', '%Y/%m/%d']
-            for fmt in formatos:
-                try:
-                    fecha_dt = datetime.strptime(valor_str, fmt)
-                    if 2020 <= fecha_dt.year <= 2030:
-                        return fecha_dt.strftime('%Y-%m-%d')
-                except:
-                    continue
+        sql = """INSERT INTO feriados (nombre, fecha_inicio, fecha_fin, total_dias, temporada, descripcion, fecha_registro)
+                 VALUES (%s, %s, %s, %s, %s, %s, NOW())"""
+        for index, row in df.iterrows():
+            if not row['fecha_inicio'] or not row['fecha_fin']:
+                errores += 1
+                if len(detalles) < 10:
+                    detalles.append(f"Fila {int(index) + 1}: falta 'fecha_inicio' o 'fecha_fin' (campos obligatorios)")
+                continue
             try:
-                fecha_dt = pd.to_datetime(valor_str, dayfirst=False)
-                if 2020 <= fecha_dt.year <= 2030:
-                    return fecha_dt.strftime('%Y-%m-%d')
-            except:
-                pass
-            return None
-
-        def extraer_genero(valor):
-            if not valor or pd.isna(valor):
-                return None
-            valor_str = str(valor).lower()
-            if any(x in valor_str for x in ['mujer', 'femenino', 'female']):
-                return 'Femenino'
-            elif any(x in valor_str for x in ['hombre', 'masculino', 'male']):
-                return 'Masculino'
-            return None
-
-        def extraer_edad(valor):
-            if not valor or pd.isna(valor):
-                return None
-            valor_str = str(valor).lower()
-            numeros = re.findall(r'\b(\d{1,3})\b', valor_str)
-            if numeros:
-                edad = int(numeros[0])
-                if 5 <= edad <= 120:
-                    return edad
-            return None
-
-        def extraer_pais(valor):
-            if not valor or pd.isna(valor):
-                return 'Ecuador'
-            valor_str = str(valor).strip()
-            if len(valor_str) > 2 and valor_str.lower() not in ['nan', 'none', '']:
-                return valor_str[:100]
-            return 'Ecuador'
-
-        def extraer_satisfaccion(row):
-            for col in df.columns:
-                valor = str(row.get(col, '')).lower()
-                if 'satisfaccion' in col.lower() or 'satisfecho' in valor:
-                    if 'muy satisfecho' in valor or '5' in valor:
-                        return 5
-                    elif 'satisfecho' in valor or '4' in valor:
-                        return 4
-                    elif 'ni satisfecho' in valor or '3' in valor:
-                        return 3
-                    elif 'insatisfecho' in valor or '2' in valor:
-                        return 2
-                    elif 'muy insatisfecho' in valor or '1' in valor:
-                        return 1
-            return 3
-        
-        print("\n🔄 Procesando filas...")
-        
-        for idx, row in df.iterrows():
-            try:
-                fila_num = int(idx) + 1
-                
-                # Extraer fecha
-                fecha_col = columnas_detectadas.get('fecha_encuesta')
-                fecha_raw = row.get(fecha_col) if fecha_col else None
-                fecha_encuesta = extraer_fecha(fecha_raw)
-                if not fecha_encuesta:
-                    fecha_encuesta = datetime.now().strftime('%Y-%m-%d')
-                
-                # Extraer género
-                genero_col = columnas_detectadas.get('genero')
-                genero_raw = row.get(genero_col) if genero_col else None
-                genero = extraer_genero(genero_raw)
-                if not genero:
-                    for col in df.columns:
-                        genero = extraer_genero(row.get(col))
-                        if genero:
-                            break
-                if not genero:
-                    genero = 'No especificado'
-                
-                # Extraer edad
-                edad_col = columnas_detectadas.get('edad')
-                edad_raw = row.get(edad_col) if edad_col else None
-                edad = extraer_edad(edad_raw)
-                if not edad:
-                    for col in df.columns:
-                        edad = extraer_edad(row.get(col))
-                        if edad:
-                            break
-                if not edad:
-                    edad = 0
-                
-                # Extraer país
-                pais_col = columnas_detectadas.get('pais_residencia')
-                pais_raw = row.get(pais_col) if pais_col else None
-                pais = extraer_pais(pais_raw)
-                
-                # Extraer satisfacción
-                satisfaccion = extraer_satisfaccion(row)
-                
-                sql = """
-                INSERT INTO encuestas_turisticas 
-                (fecha_encuesta, genero, edad, pais_residencia, 
-                 ciudad_residencia, motivo_visita, noches_estadia,
-                 gasto_total, nivel_satisfaccion, probabilidad_retorno,
-                 fecha_registro)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
-                """
-                
-                values = (
-                    fecha_encuesta,
-                    genero,
-                    edad,
-                    pais,
-                    '',
-                    '',
-                    0,
-                    0.0,
-                    satisfaccion,
-                    satisfaccion
-                )
-                
-                cursor.execute(sql, values)
+                cursor.execute(sql, (row['nombre'] or '', row['fecha_inicio'], row['fecha_fin'],
+                                      int(row['total_dias']) if row['total_dias'] else 1,
+                                      row['temporada'] or 'Media', row['descripcion'] or ''))
                 insertados += 1
-                
-                if insertados % 100 == 0:
-                    print(f"    Procesados: {insertados} registros...")
-                
             except Exception as e:
                 errores += 1
-                if len(detalles) < 5:
-                    detalles.append(f"Fila {fila_num}: {str(e)[:80]}")
-        
+                if len(detalles) < 10:
+                    detalles.append(f"Fila {int(index) + 1}: {str(e)[:120]}")
         connection.commit()
-        
-        print("\n" + "="*60)
-        print("✅ PROCESO ETL COMPLETADO")
-        print("="*60)
-        print(f"📊 Total procesado: {len(df)}")
-        print(f"✅ Insertados: {insertados}")
-        print(f"❌ Errores: {errores}")
-        if len(df) > 0:
-            print(f"📈 Tasa de éxito: {(insertados/len(df)*100):.2f}%")
-        print("="*60)
-        
     except Exception as e:
-        print(f"❌ ERROR CRÍTICO: {str(e)}")
-        import traceback
-        traceback.print_exc()
         connection.rollback()
         raise e
     finally:
         cursor.close()
         connection.close()
-    
+    return {'insertados': insertados, 'errores': errores, 'detalles': detalles}
+
+
+def procesar_encuestas(df):
+    """Inserta encuestas turísticas. `df` ya viene con columnas canónicas,
+    tipos convertidos, textos normalizados y nulos rellenados (texto libre
+    -> 'Prefiero no responder', numéricos -> 0)."""
+    connection = get_db_connection()
+    cursor = connection.cursor()
+    insertados, errores, detalles = 0, 0, []
+
+    try:
+        sql = """
+        INSERT INTO encuestas_turisticas
+        (fecha_encuesta, genero, edad, pais_residencia, ciudad_residencia,
+         motivo_visita, noches_estadia, gasto_total, nivel_satisfaccion,
+         probabilidad_retorno, fecha_registro)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+        """
+        for index, row in df.iterrows():
+            try:
+                fecha_encuesta = row['fecha_encuesta'] or datetime.now().strftime('%Y-%m-%d')
+                cursor.execute(sql, (
+                    fecha_encuesta, row['genero'], int(row['edad']),
+                    row['pais_residencia'], row['ciudad_residencia'], row['motivo_visita'],
+                    int(row['noches_estadia']), float(row['gasto_total']),
+                    int(row['nivel_satisfaccion']), int(row['probabilidad_retorno'])
+                ))
+                insertados += 1
+            except Exception as e:
+                errores += 1
+                if len(detalles) < 10:
+                    detalles.append(f"Fila {int(index) + 1}: {str(e)[:120]}")
+
+        connection.commit()
+    except Exception as e:
+        connection.rollback()
+        raise e
+    finally:
+        cursor.close()
+        connection.close()
+
     return {'insertados': insertados, 'errores': errores, 'detalles': detalles}
 
 # ==========================================
@@ -563,6 +424,41 @@ class PrediccionRangoRequest(BaseModel):
     fecha_inicio: str
     fecha_fin: str
     id_hotel: Optional[int] = 1
+
+class VariablesEstacionalesRequest(BaseModel):
+    fecha_inicio: Optional[str] = None
+    fecha_fin: Optional[str] = None
+
+@app.post("/variables-estacionales/generar")
+async def generar_variables_estacionales_endpoint(request: VariablesEstacionalesRequest = VariablesEstacionalesRequest()):
+    """Recalcula variables_estacionales (mes, dia_semana, es_festivo,
+    es_temporada_alta, semana_ano, factor_estacional) para un rango de fechas.
+    Útil para regenerar después de cargar/editar festivos o temporadas.
+    Sin fechas, regenera un rango por defecto de un año hacia atrás y hacia adelante."""
+    try:
+        if request.fecha_inicio and request.fecha_fin:
+            fecha_inicio = datetime.strptime(request.fecha_inicio, '%Y-%m-%d').date()
+            fecha_fin = datetime.strptime(request.fecha_fin, '%Y-%m-%d').date()
+        else:
+            hoy = datetime.now().date()
+            fecha_inicio = hoy.replace(year=hoy.year - 1)
+            fecha_fin = hoy.replace(year=hoy.year + 1)
+
+        if fecha_fin < fecha_inicio:
+            raise HTTPException(status_code=400, detail="fecha_fin no puede ser anterior a fecha_inicio")
+
+        total = generar_variables_estacionales(fecha_inicio, fecha_fin)
+        return {
+            "success": True,
+            "mensaje": "Variables estacionales generadas",
+            "fecha_inicio": fecha_inicio.isoformat(),
+            "fecha_fin": fecha_fin.isoformat(),
+            "filas_generadas": total
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error generando variables estacionales: {str(e)}")
 
 @app.post("/entrenar")
 async def entrenar_modelo():
@@ -624,6 +520,12 @@ async def predecir_ocupacion(request: PrediccionRequest):
                 raise HTTPException(status_code=400, detail="No hay modelo entrenado. Primero ejecuta /entrenar")
             print("✅ Modelo cargado exitosamente")
         
+        # Variables de calendario (mes, dia_semana, es_festivo, es_temporada_alta,
+        # semana_ano, factor_estacional) - las mismas que usa el entrenamiento,
+        # generadas/leídas desde variables_estacionales para esa fecha.
+        fecha_obj = datetime.strptime(request.fecha_objetivo, '%Y-%m-%d').date()
+        ve = obtener_o_generar(fecha_obj)
+
         # Preparar datos
         datos = {
             'fecha': request.fecha_objetivo,
@@ -634,7 +536,13 @@ async def predecir_ocupacion(request: PrediccionRequest):
             'humedad': request.humedad or 70,
             'precipitacion': request.precipitacion or 0,
             'total_dias': request.total_dias or 3,
-            'temporada': request.temporada or "Media"
+            'temporada': request.temporada or "Media",
+            'mes': ve['mes'],
+            'dia_semana': ve['dia_semana'],
+            'es_festivo': ve['es_festivo'],
+            'es_temporada_alta': ve['es_temporada_alta'],
+            'semana_ano': ve['semana_ano'],
+            'factor_estacional': ve['factor_estacional']
         }
         
         print(f"📊 Datos procesados: {datos}")
@@ -759,6 +667,8 @@ async def predecir_ocupacion_rango(request: PrediccionRangoRequest):
             if es_fin_semana and temporada == "Media":
                 temporada = "Alta"
                 
+            ve = obtener_o_generar(fecha_dt.date())
+
             datos_dia = {
                 'fecha': fecha_str,
                 'checkin_nacionales': 60 if temporada == "Alta" else 35,
@@ -768,7 +678,13 @@ async def predecir_ocupacion_rango(request: PrediccionRangoRequest):
                 'humedad': hum,
                 'precipitacion': prec,
                 'total_dias': total_dias_feriado,
-                'temporada': temporada
+                'temporada': temporada,
+                'mes': ve['mes'],
+                'dia_semana': ve['dia_semana'],
+                'es_festivo': ve['es_festivo'],
+                'es_temporada_alta': ve['es_temporada_alta'],
+                'semana_ano': ve['semana_ano'],
+                'factor_estacional': ve['factor_estacional']
             }
             
             val_pred = modelo.predecir(datos_dia)
@@ -827,6 +743,77 @@ async def predecir_ocupacion_rango(request: PrediccionRangoRequest):
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error en proyección: {str(e)}")
+
+@app.get("/predicciones-historicas")
+async def predicciones_historicas(limite: Optional[int] = None, dias: Optional[int] = None):
+    """Valida el modelo contra datos reales ya cargados: por cada registro
+    histórico de ocupacion_hotelera, genera una predicción con las mismas
+    variables usadas en el entrenamiento y la compara contra el valor real."""
+    try:
+        if not modelo.modelo_entrenado:
+            if not modelo.cargar_modelo():
+                raise HTTPException(status_code=400, detail="No hay modelo entrenado. Ejecuta primero /entrenar.")
+
+        df = obtener_dataset_ml()
+        if df is None or len(df) == 0:
+            return {"precision_promedio": 0, "total_registros": 0, "error_promedio": 0, "predicciones": []}
+
+        df['fecha'] = pd.to_datetime(df['fecha'])
+        if dias:
+            fecha_limite = df['fecha'].max() - pd.Timedelta(days=dias)
+            df = df[df['fecha'] >= fecha_limite]
+
+        df = df.sort_values('fecha', ascending=False)
+        if limite:
+            df = df.head(limite)
+
+        predicciones = []
+        errores = []
+
+        for _, row in df.iterrows():
+            datos = row.to_dict()
+            real = float(datos.pop('ocupacion_porcentaje'))
+            fecha_str = datos['fecha'].strftime('%Y-%m-%d')
+            datos['fecha'] = fecha_str
+
+            try:
+                predicho = float(modelo.predecir(datos))
+            except Exception as e:
+                print(f"⚠️ No se pudo predecir la fila de {fecha_str}: {e}")
+                continue
+
+            error = abs(real - predicho)
+            if real > 0:
+                precision_fila = max(0, 100 - (error / real * 100))
+            else:
+                precision_fila = 100 if predicho == 0 else 0
+
+            errores.append(error)
+            predicciones.append({
+                "fecha": fecha_str,
+                "valor_real": round(real, 2),
+                "valor_predicho": round(predicho, 2),
+                "error": round(error, 2),
+                "precision": round(precision_fila, 2)
+            })
+
+        total = len(predicciones)
+        error_promedio = round(sum(errores) / total, 2) if total else 0
+        precision_promedio = round(sum(p['precision'] for p in predicciones) / total, 2) if total else 0
+
+        return {
+            "precision_promedio": precision_promedio,
+            "total_registros": total,
+            "error_promedio": error_promedio,
+            "predicciones": predicciones
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ ERROR en validación histórica: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Error en validación histórica: {str(e)}")
 
 if __name__ == "__main__":
     print("\n" + "="*60)
