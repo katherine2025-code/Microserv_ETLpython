@@ -102,13 +102,20 @@ def leer_archivo(filename: str, contents: bytes) -> pd.DataFrame:
     ultimo_error = None
     for encoding in ('utf-8-sig', 'utf-8', 'latin-1'):
         try:
+            # index_col=False es obligatorio aquí: si alguna fila de datos
+            # trae más campos que el encabezado (columnas finales vacías sin
+            # su ';' correspondiente, algo común en exports de Kobo), pandas
+            # asume por defecto que la(s) columna(s) sobrante(s) son un
+            # índice y RECORRE todo el resto de columnas una posición sin
+            # avisar - corrompe el archivo entero en silencio. Con
+            # index_col=False no crea ese índice implícito.
             df = pd.read_csv(io.BytesIO(contents), sep=';', encoding=encoding,
-                              on_bad_lines='skip', dtype=str)
+                              on_bad_lines='skip', dtype=str, index_col=False)
             if df.shape[1] == 1:
                 # El separador ';' no aplicó (el archivo viene con coma);
                 # se intenta como último recurso para no rechazar el archivo.
                 df_coma = pd.read_csv(io.BytesIO(contents), sep=',', encoding=encoding,
-                                       on_bad_lines='skip', dtype=str)
+                                       on_bad_lines='skip', dtype=str, index_col=False)
                 if df_coma.shape[1] > 1:
                     return df_coma
             return df

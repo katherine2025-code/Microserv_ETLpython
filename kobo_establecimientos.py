@@ -28,10 +28,13 @@ sub-registros (repeticiones 'fila', 'fila_1' .. 'fila_4') que se SUMAN para
 obtener el total de pernoctaciones/habitaciones ocupadas de ese día, y se
 PROMEDIA la tarifa cobrada entre los sub-registros que la reportaron.
 
-El archivo no trae un id_hotel: trae el nombre real del establecimiento. El
-hotel debe existir previamente en la tabla `hoteles` (creado desde el panel);
-si no hay una coincidencia exacta por nombre normalizado, la fila se reporta
-como error en vez de crear un hotel nuevo automáticamente.
+El archivo no trae un id_hotel: trae el nombre real del establecimiento. Si
+ya existe un hotel con ese nombre (normalizado) en `hoteles`, se usa su
+id_hotel; si no existe, se crea automáticamente con los datos disponibles
+del propio formulario (nombre, parroquia, habitaciones) - así una carga real
+no se bloquea por hoteles no registrados de antemano. Los hoteles creados así
+quedan marcados en la advertencia de la respuesta para que el administrador
+los revise/complete después desde el panel.
 """
 import re
 import pandas as pd
@@ -181,6 +184,7 @@ def detectar_columnas(df):
 
     return {
         'nombre': col_nombre,
+        'parroquia': col_parroquia,
         'habitaciones_disponibles': col_habitaciones,
         'nacionales': col_nacionales,
         'extranjeros': col_extranjeros,
@@ -191,11 +195,13 @@ def extraer_registro_dia(row, columnas_todas, columnas_detectadas):
     """A partir de una fila cruda del archivo, arma el registro de ocupación
     de ESE día (sumando las hasta 5 repeticiones internas del envío)."""
     col_nombre = columnas_detectadas['nombre']
+    col_parroquia = columnas_detectadas.get('parroquia')
     col_hab = columnas_detectadas['habitaciones_disponibles']
     col_nac = columnas_detectadas['nacionales']
     col_ext = columnas_detectadas['extranjeros']
 
     nombre_establecimiento = _norm(row[col_nombre]) if col_nombre else ''
+    parroquia = _norm(row[col_parroquia]).title() if col_parroquia and pd.notna(row[col_parroquia]) else None
     habitaciones_disponibles = _a_entero(row[col_hab]) if col_hab else None
     nacionales = _a_entero(row[col_nac]) if col_nac else 0
     extranjeros = _a_entero(row[col_ext]) if col_ext else 0
@@ -231,6 +237,7 @@ def extraer_registro_dia(row, columnas_todas, columnas_detectadas):
 
     return {
         'nombre_establecimiento': nombre_establecimiento,
+        'parroquia': parroquia,
         'checkin_nacionales': nacionales or 0,
         'checkin_extranjeros': extranjeros or 0,
         'pernoctaciones': total_pernoctaciones,
@@ -263,12 +270,18 @@ def procesar_establecimientos(df, get_db_connection):
     connection = get_db_connection()
     cursor = connection.cursor()
     insertados, errores, detalles = 0, 0, []
+    hoteles_creados = []
 
     try:
         cursor.execute("SELECT id_hotel, LOWER(TRIM(nombre)) AS nombre_norm FROM hoteles")
         hoteles_por_nombre = {}
         for fila in cursor.fetchall():
             hoteles_por_nombre.setdefault(fila['nombre_norm'], []).append(fila['id_hotel'])
+
+        sql_crear_hotel = """
+        INSERT INTO hoteles (nombre, parroquia, habitaciones_totales, created_at, updated_at)
+        VALUES (%s, %s, %s, NOW(), NOW())
+        """
 
         sql = """
         INSERT INTO ocupacion_hotelera
@@ -300,13 +313,19 @@ def procesar_establecimientos(df, get_db_connection):
 
                 candidatos = hoteles_por_nombre.get(nombre_norm)
                 if not candidatos:
-                    errores += 1
-                    if len(detalles) < 10:
-                        detalles.append(
-                            f"Fila {fila_num}: hotel '{registro['nombre_establecimiento']}' no encontrado. "
-                            f"Regístralo primero en Hoteles."
-                        )
-                    continue
+                    # No existe: se crea automáticamente con lo que trae el
+                    # formulario, para no bloquear la carga por hoteles no
+                    # registrados de antemano. El admin puede completar los
+                    # demás datos (categoría, contacto, etc.) después.
+                    cursor.execute(sql_crear_hotel, (
+                        registro['nombre_establecimiento'],
+                        registro['parroquia'],
+                        registro['habitaciones_disponibles'] or 0
+                    ))
+                    nuevo_id_hotel = cursor.lastrowid
+                    hoteles_por_nombre[nombre_norm] = [nuevo_id_hotel]
+                    candidatos = [nuevo_id_hotel]
+                    hoteles_creados.append(registro['nombre_establecimiento'])
                 if len(candidatos) > 1:
                     errores += 1
                     if len(detalles) < 10:
@@ -337,5 +356,13 @@ def procesar_establecimientos(df, get_db_connection):
     finally:
         cursor.close()
         connection.close()
+
+    if hoteles_creados:
+        advertencias.append(
+            f"Se crearon {len(hoteles_creados)} hotel(es) nuevo(s) automáticamente a partir del archivo: "
+            + ", ".join(hoteles_creados[:10])
+            + ("..." if len(hoteles_creados) > 10 else "")
+            + ". Revisa/completa sus datos en Hoteles (categoría, contacto, etc.)."
+        )
 
     return {'insertados': insertados, 'errores': errores, 'detalles': detalles, 'advertencias': advertencias}

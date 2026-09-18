@@ -15,6 +15,7 @@ from modelo import ModeloPredictor
 from etl_utils import CANONICAL_SCHEMAS, leer_archivo, mapear_posicional, limpiar_y_convertir
 from variables_estacionales import generar_variables_estacionales, obtener_o_generar
 from kobo_establecimientos import es_formulario_establecimientos, procesar_establecimientos
+from kobo_encuestas_turismo import es_formulario_turismo, procesar_encuestas_turismo
 
 # Configurar logging
 logging.basicConfig(level=logging.INFO)
@@ -188,6 +189,11 @@ async def procesar_csv(file: UploadFile = File(...), tipo: str = Form(None)):
         if tipo == 'ocupacion' and es_formulario_establecimientos(df_crudo.columns):
             print("📋 Formulario detectado: Establecimientos de Alojamiento (Kobo)")
             resultado = procesar_establecimientos(df_crudo, get_db_connection)
+            advertencias = resultado.get('advertencias', [])
+            total_registros = len(df_crudo)
+        elif tipo == 'encuestas' and es_formulario_turismo(df_crudo.columns):
+            print("📋 Formulario detectado: Recolección de datos Turismo (Kobo)")
+            resultado = procesar_encuestas_turismo(df_crudo, get_db_connection)
             advertencias = resultado.get('advertencias', [])
             total_registros = len(df_crudo)
         else:
