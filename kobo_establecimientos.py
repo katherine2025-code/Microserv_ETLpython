@@ -39,6 +39,8 @@ los revise/complete después desde el panel.
 import re
 import pandas as pd
 
+from cantones import canton_de_parroquia, columnas_de
+
 MARCADOR_FORMULARIO = 'display:none'
 REPETICIONES = ['fila', 'fila_1', 'fila_2', 'fila_3', 'fila_4']
 
@@ -278,10 +280,15 @@ def procesar_establecimientos(df, get_db_connection):
         for fila in cursor.fetchall():
             hoteles_por_nombre.setdefault(fila['nombre_norm'], []).append(fila['id_hotel'])
 
-        sql_crear_hotel = """
-        INSERT INTO hoteles (nombre, parroquia, habitaciones_totales, created_at, updated_at)
-        VALUES (%s, %s, %s, NOW(), NOW())
-        """
+        # Cantón (Santa Elena / Salinas) deducido de la parroquia, si la BD ya tiene la columna
+        con_canton = 'canton' in columnas_de(cursor, 'hoteles')
+        sql_crear_hotel = (
+            "INSERT INTO hoteles (nombre, parroquia, habitaciones_totales, canton, created_at, updated_at) "
+            "VALUES (%s, %s, %s, %s, NOW(), NOW())"
+            if con_canton else
+            "INSERT INTO hoteles (nombre, parroquia, habitaciones_totales, created_at, updated_at) "
+            "VALUES (%s, %s, %s, NOW(), NOW())"
+        )
 
         sql = """
         INSERT INTO ocupacion_hotelera
@@ -317,11 +324,14 @@ def procesar_establecimientos(df, get_db_connection):
                     # formulario, para no bloquear la carga por hoteles no
                     # registrados de antemano. El admin puede completar los
                     # demás datos (categoría, contacto, etc.) después.
-                    cursor.execute(sql_crear_hotel, (
+                    valores_hotel = [
                         registro['nombre_establecimiento'],
                         registro['parroquia'],
                         registro['habitaciones_disponibles'] or 0
-                    ))
+                    ]
+                    if con_canton:
+                        valores_hotel.append(canton_de_parroquia(registro['parroquia']))
+                    cursor.execute(sql_crear_hotel, valores_hotel)
                     nuevo_id_hotel = cursor.lastrowid
                     hoteles_por_nombre[nombre_norm] = [nuevo_id_hotel]
                     candidatos = [nuevo_id_hotel]

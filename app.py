@@ -16,6 +16,7 @@ from etl_utils import CANONICAL_SCHEMAS, leer_archivo, mapear_posicional, limpia
 from variables_estacionales import generar_variables_estacionales, obtener_o_generar
 from kobo_establecimientos import es_formulario_establecimientos, procesar_establecimientos
 from kobo_encuestas_turismo import es_formulario_turismo, procesar_encuestas_turismo
+from ots_app_encuestas import es_csv_app, tipo_encuesta_del_archivo, procesar_encuestas_app
 
 # Configurar logging
 logging.basicConfig(level=logging.INFO)
@@ -186,7 +187,29 @@ async def procesar_csv(file: UploadFile = File(...), tipo: str = Form(None)):
         # El formulario Kobo "Establecimientos de Alojamiento" tiene su propia
         # estructura (grupo repetido de hasta 5 registros por envío, sin
         # id_hotel) y se procesa aparte - ver kobo_establecimientos.py.
-        if tipo == 'ocupacion' and es_formulario_establecimientos(df_crudo.columns):
+        # CSV generado por la propia app OTS (encuestas llenadas por los encuestadores):
+        # columnas por código de pregunta. Se evalúa primero porque es el flujo principal.
+        if tipo in ('encuestas', 'ocupacion') and es_csv_app(df_crudo.columns):
+            tipo_archivo = tipo_encuesta_del_archivo(df_crudo)
+            esperado = 'turista' if tipo == 'encuestas' else 'hotel'
+            if tipo_archivo is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="El archivo mezcla encuestas de distinto tipo o el 'tipo_encuesta' no es "
+                           "'turista' ni 'hotel'. Descarga un archivo por cada tipo de encuesta."
+                )
+            if tipo_archivo != esperado:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"El archivo contiene encuestas de tipo '{tipo_archivo}' pero seleccionaste "
+                           f"'{'Ocupación Hotelera' if tipo == 'ocupacion' else 'Encuestas Turísticas'}'. "
+                           f"Elige '{'Encuestas Turísticas' if tipo_archivo == 'turista' else 'Ocupación Hotelera'}'."
+                )
+            print(f"📋 Formato detectado: CSV de la app OTS ({tipo_archivo})")
+            resultado = procesar_encuestas_app(df_crudo, tipo_archivo, get_db_connection)
+            advertencias = resultado.get('advertencias', [])
+            total_registros = len(df_crudo)
+        elif tipo == 'ocupacion' and es_formulario_establecimientos(df_crudo.columns):
             print("📋 Formulario detectado: Establecimientos de Alojamiento (Kobo)")
             resultado = procesar_establecimientos(df_crudo, get_db_connection)
             advertencias = resultado.get('advertencias', [])

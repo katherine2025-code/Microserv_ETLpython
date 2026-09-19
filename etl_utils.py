@@ -80,6 +80,9 @@ TOKENS_NULOS = {'', 'nan', 'null', 'none', 'n/a', 'na', '-', 's/n', 'no aplica',
 # ==========================================================================
 # LECTURA DE ARCHIVO (.csv / .xlsx)
 # ==========================================================================
+class SeparadorInvalido(ValueError):
+    """El CSV no usa ';' como separador."""
+
 def leer_archivo(filename: str, contents: bytes) -> pd.DataFrame:
     """Lee un CSV (separado por ';') o un XLSX y devuelve el DataFrame crudo,
     con todas las celdas como texto (la conversión de tipos ocurre después,
@@ -112,13 +115,17 @@ def leer_archivo(filename: str, contents: bytes) -> pd.DataFrame:
             df = pd.read_csv(io.BytesIO(contents), sep=';', encoding=encoding,
                               on_bad_lines='skip', dtype=str, index_col=False)
             if df.shape[1] == 1:
-                # El separador ';' no aplicó (el archivo viene con coma);
-                # se intenta como último recurso para no rechazar el archivo.
-                df_coma = pd.read_csv(io.BytesIO(contents), sep=',', encoding=encoding,
-                                       on_bad_lines='skip', dtype=str, index_col=False)
-                if df_coma.shape[1] > 1:
-                    return df_coma
+                # El separador oficial es ';' y NO se acepta la coma como respaldo: un texto
+                # con comas ("Hotel Sol, Salinas") se partiría en columnas distintas y
+                # corrompería los datos en silencio. Es mejor rechazar el archivo con un aviso.
+                raise SeparadorInvalido(
+                    "El archivo CSV debe estar separado por punto y coma (;). No se detectó ese "
+                    "separador (el archivo parece usar comas u otro carácter). En Excel: Guardar como "
+                    "'CSV (delimitado por punto y coma)'."
+                )
             return df
+        except SeparadorInvalido:
+            raise
         except Exception as e:
             ultimo_error = e
             continue
