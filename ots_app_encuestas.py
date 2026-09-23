@@ -303,10 +303,13 @@ def _extraer_hotel(row, fecha_captura):
         fechas_vistas.add(fecha)
 
         ocupadas = _entero(row, f'fecha{n}_habitaciones') or 0
+        nacionales_dia = _entero(row, f'fecha{n}_nacionales') or 0
+        extranjeros_dia = _entero(row, f'fecha{n}_extranjeros') or 0
         bloques.append({
             'fecha': fecha,
-            'checkin_nacionales': _entero(row, f'fecha{n}_nacionales') or 0,
-            'checkin_extranjeros': _entero(row, f'fecha{n}_extranjeros') or 0,
+            'checkin_nacionales': nacionales_dia,
+            'checkin_extranjeros': extranjeros_dia,
+            'total_turistas': nacionales_dia + extranjeros_dia,
             'pernoctaciones': _entero(row, f'fecha{n}_pernoctaciones') or 0,
             'habitaciones_ocupadas': ocupadas,
             'tarifa_cobrada': _decimal(row, f'fecha{n}_tarifa') or 0.0,
@@ -354,8 +357,12 @@ def _sql_crear_hotel(columnas_hoteles):
 
 
 def _sql_ocupacion(columnas_ocupacion):
-    campos = ['id_hotel', 'fecha', 'checkin_nacionales', 'checkin_extranjeros', 'pernoctaciones',
-              'habitaciones_ocupadas', 'habitaciones_disponibles', 'tarifa_cobrada', 'ocupacion_porcentaje']
+    # total_turistas y habitaciones_totales: el backend los calcula solo cuando se inserta por
+    # Sequelize (hooks beforeCreate/beforeUpdate); el ETL inserta con SQL directo y esos hooks no
+    # corren, así que se calculan aquí (ver _extraer_hotel) para no dejarlos en 0.
+    campos = ['id_hotel', 'fecha', 'checkin_nacionales', 'checkin_extranjeros', 'total_turistas', 'pernoctaciones',
+              'habitaciones_ocupadas', 'habitaciones_disponibles', 'habitaciones_totales',
+              'tarifa_cobrada', 'ocupacion_porcentaje']
     if 'feriado' in columnas_ocupacion:
         campos.append('feriado')
     marcas = ', '.join(['%s'] * len(campos))
@@ -505,10 +512,13 @@ def procesar_encuestas_app(df, tipo_encuesta, get_db_connection):
                         hoteles_por_nombre[nombre_norm] = [
                             (i, r['canton'] if i == id_hotel else c) for i, c in hoteles_por_nombre[nombre_norm]]
 
-                    # Un registro de ocupación por cada día del feriado reportado
+                    # Un registro de ocupación por cada día del feriado reportado. habitaciones_totales
+                    # usa el mismo valor que habitaciones_disponibles: el formulario no pregunta un
+                    # "total" aparte, solo la capacidad que el hotel reportó ese feriado.
                     for b in r['bloques']:
                         valores = [id_hotel, b['fecha'], b['checkin_nacionales'], b['checkin_extranjeros'],
-                                   b['pernoctaciones'], b['habitaciones_ocupadas'], r['habitaciones_disponibles'],
+                                   b['total_turistas'], b['pernoctaciones'], b['habitaciones_ocupadas'],
+                                   r['habitaciones_disponibles'], r['habitaciones_disponibles'],
                                    b['tarifa_cobrada'], b['ocupacion_porcentaje']]
                         if con_feriado:
                             valores.append(r['feriado'])

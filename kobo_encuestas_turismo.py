@@ -28,10 +28,24 @@ fecha_encuesta viene de la columna 'start' (fecha de inicio del envío).
 ciudad_residencia no existe en este formulario - se guarda como
 "Prefiero no responder" siempre (misma convención usada para nulos de texto).
 """
+import json
 import re
 import pandas as pd
 
+from etl_utils import _reparar_mojibake
+from cantones import columnas_de
+
 MARCADOR_FORMULARIO = 'nivel de satisfaccion'
+
+# Los 15 lugares que ofrece la pregunta "¿Qué lugares piensa visitar...?" del formulario de Kobo
+# (selección múltiple). MISMA lista que ots_front/.../lugares.service.ts y el mapa del dashboard
+# (backend_ots/src/seeds/lugaresSeed.js) - si se agrega un lugar nuevo a la pregunta, agregarlo
+# también ahí para que el mapa lo reconozca.
+LUGARES_CONOCIDOS = [
+    'Montañita', 'Olón', 'Manglaralto', 'Ayampe', 'Ayangue', 'Salinas', 'Chipipe',
+    'La Chocolatera', 'Canoa', 'San Pablo', 'Playa Ballenita', 'La Lobería',
+    'Cerro El Morro', 'San Lorenzo', 'San Pedro'
+]
 
 PROBABILIDAD_RETORNO_NOTA = (
     "El mapeo de 'probabilidad_retorno' es una suposición (columna siguiente a "
@@ -219,6 +233,28 @@ FRECUENCIA_MAPEO = {
 }
 
 
+def _detectar_columna_lugares(columnas):
+    """La pregunta de lugares visitados se identifica por CONTENIDO del encabezado (aparece con
+    y sin el prefijo de sección según la versión del formulario), no por posición."""
+    for c in columnas:
+        texto = _norm(c).lower()
+        if 'lugares' in texto and 'visit' in texto:
+            return c
+    return None
+
+
+def extraer_lugares(valor):
+    """La respuesta llega como los nombres de los lugares elegidos, PEGADOS uno tras otro sin
+    separador (p. ej. 'La Chocolatera La Lobería Cerro El Morro Chipipe'), porque Kobo exporta
+    así esta pregunta de selección múltiple en este formulario. Como ningún lugar de
+    LUGARES_CONOCIDOS es substring de otro, buscar cada nombre completo como frase dentro del
+    texto es suficiente y no requiere adivinar dónde corta cada palabra."""
+    if not _valor_valido(valor):
+        return []
+    texto = _reparar_mojibake(_norm(valor)).lower()
+    return [lugar for lugar in LUGARES_CONOCIDOS if lugar.lower() in texto]
+
+
 def _extraer_tamano_grupo(row, columnas):
     for col in columnas:
         valor = row.get(col)
@@ -305,6 +341,7 @@ def procesar_encuestas_turismo(df, get_db_connection):
         (i for i, c in enumerate(columnas_pregunta) if MARCADOR_FORMULARIO in _norm(c).lower()),
         None
     )
+    col_lugares = _detectar_columna_lugares(df.columns)
 
     advertencias = []
     if idx_nivel_satisfaccion is None:
@@ -314,24 +351,56 @@ def procesar_encuestas_turismo(df, get_db_connection):
         )
     else:
         advertencias.append(PROBABILIDAD_RETORNO_NOTA)
+    if not col_lugares:
+        advertencias.append(
+            "Este archivo no trae la pregunta de lugares visitados (o no se pudo identificar); "
+            "estos registros no aparecerán en el mapa del dashboard."
+        )
 
     connection = get_db_connection()
     cursor = connection.cursor()
-    insertados, errores, detalles = 0, 0, []
+    insertados, errores, omitidos, detalles = 0, 0, 0, []
+    columnas_bd = columnas_de(cursor, 'encuestas_turisticas')
+    con_lugares = col_lugares is not None and 'lugares_visitados' in columnas_bd
+    if col_lugares and not con_lugares:
+        advertencias.append(
+            "Reinicia el backend para aplicar la actualización de la base de datos: sin ella no "
+            "se guardan los lugares visitados de este archivo."
+        )
+
+    # uuid_kobo identifica el envío de forma única (columna "_uuid" del export de Kobo). Con esto,
+    # subir dos veces el mismo archivo ya no duplica encuestas: la fila se omite si su _uuid ya está.
+    con_uuid = 'uuid_kobo' in columnas_bd
+    uuids_existentes = set()
+    if con_uuid:
+        cursor.execute("SELECT uuid_kobo FROM encuestas_turisticas WHERE uuid_kobo IS NOT NULL")
+        uuids_existentes = {f['uuid_kobo'] for f in cursor.fetchall()}
+    else:
+        advertencias.append(
+            "Reinicia el backend para activar la protección contra cargas duplicadas de este "
+            "archivo (falta la columna encuestas_turisticas.uuid_kobo)."
+        )
 
     try:
-        sql = """
-        INSERT INTO encuestas_turisticas
-        (fecha_encuesta, genero, edad, pais_residencia, ciudad_residencia,
-         nivel_educativo, ocupacion, tamano_grupo, frecuencia_visitas,
-         motivo_visita, noches_estadia, gasto_total, nivel_satisfaccion,
-         probabilidad_retorno, fecha_registro)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
-        """
+        campos = ['fecha_encuesta', 'genero', 'edad', 'pais_residencia', 'ciudad_residencia',
+                  'nivel_educativo', 'ocupacion', 'tamano_grupo', 'frecuencia_visitas',
+                  'motivo_visita', 'noches_estadia', 'gasto_total', 'nivel_satisfaccion',
+                  'probabilidad_retorno']
+        if con_lugares:
+            campos.append('lugares_visitados')
+        if con_uuid:
+            campos.append('uuid_kobo')
+        marcas = ', '.join(['%s'] * len(campos))
+        sql = f"INSERT INTO encuestas_turisticas ({', '.join(campos)}, fecha_registro) VALUES ({marcas}, NOW())"
 
         for index, row in df.iterrows():
             fila_num = int(index) + 2  # +1 por índice 0, +1 por la fila de encabezado
             try:
+                uuid_fila = _norm(row.get('_uuid')) if con_uuid and _valor_valido(row.get('_uuid')) else None
+                if uuid_fila and uuid_fila in uuids_existentes:
+                    omitidos += 1
+                    continue
+
                 fecha_dt = _parsear_fecha_start(row.get('start'))
                 if pd.isna(fecha_dt):
                     errores += 1
@@ -342,14 +411,23 @@ def procesar_encuestas_turismo(df, get_db_connection):
 
                 registro = extraer_registro(row, columnas_pregunta, idx_nivel_satisfaccion)
 
-                cursor.execute(sql, (
+                valores = [
                     fecha, registro['genero'], registro['edad'], registro['pais_residencia'],
                     'Prefiero no responder',  # ciudad_residencia: no existe en este formulario
                     registro['nivel_educativo'], registro['ocupacion'], registro['tamano_grupo'],
                     registro['frecuencia_visitas'], registro['motivo_visita'],
                     registro['noches_estadia'], registro['gasto_total'],
                     registro['nivel_satisfaccion'], registro['probabilidad_retorno']
-                ))
+                ]
+                if con_lugares:
+                    lugares = extraer_lugares(row.get(col_lugares)) if col_lugares else []
+                    valores.append(json.dumps(lugares, ensure_ascii=False))
+                if con_uuid:
+                    valores.append(uuid_fila)
+
+                cursor.execute(sql, valores)
+                if uuid_fila:
+                    uuids_existentes.add(uuid_fila)  # protege también contra duplicados DENTRO del mismo archivo
                 insertados += 1
             except Exception as e:
                 errores += 1
@@ -364,4 +442,9 @@ def procesar_encuestas_turismo(df, get_db_connection):
         cursor.close()
         connection.close()
 
-    return {'insertados': insertados, 'errores': errores, 'detalles': detalles, 'advertencias': advertencias}
+    if omitidos:
+        advertencias.append(
+            f"{omitidos} fila(s) ya estaban cargadas (mismo envío de Kobo) y se omitieron - no se duplicaron."
+        )
+
+    return {'insertados': insertados, 'errores': errores, 'omitidos': omitidos, 'detalles': detalles, 'advertencias': advertencias}

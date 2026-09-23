@@ -39,6 +39,7 @@ los revise/complete después desde el panel.
 import re
 import pandas as pd
 
+from etl_utils import _reparar_mojibake
 from cantones import canton_de_parroquia, columnas_de
 
 MARCADOR_FORMULARIO = 'display:none'
@@ -63,7 +64,10 @@ def _norm(texto) -> str:
 
 
 def _norm_nombre(texto) -> str:
-    return _norm(texto).lower()
+    # Reparar mojibake ANTES de usarlo como clave de búsqueda/creación de hotel: sin esto, el
+    # mismo hotel podía terminar duplicado con un nombre distinto (con caracteres corruptos) cada
+    # vez que el archivo llegaba con una codificación distinta a la de la carga anterior.
+    return _reparar_mojibake(_norm(texto)).lower()
 
 
 def _a_entero(valor):
@@ -137,6 +141,42 @@ def _detectar_columna_direccion(df, candidatas):
     return mejor_col
 
 
+def _totales_ocupadas_por_fila(df, columnas_todas):
+    """Suma, por fila, las 'Habitaciones ocupadas' de todas las repeticiones
+    presentes en el archivo (mismo cálculo que extraer_registro_dia, pero
+    vectorizado para validar la columna de habitaciones_disponibles antes de
+    procesar fila por fila). Devuelve (serie_totales, cantidad_de_repeticiones)."""
+    columnas_rep = [_buscar_columna(columnas_todas, rep, 'Habitaciones ocupadas') for rep in REPETICIONES]
+    columnas_rep = [c for c in columnas_rep if c is not None]
+    if not columnas_rep:
+        return pd.Series(0, index=df.index), 0
+    total = sum(df[c].map(_a_entero).fillna(0) for c in columnas_rep)
+    return total, len(columnas_rep)
+
+
+CAPACIDAD_MAXIMA_PLAUSIBLE = 500  # ningún hotel de la zona tiene más habitaciones que esto
+
+
+def _validar_columna_habitaciones(df, col, ocupadas_totales, max_repeticiones):
+    """Comprueba si `col` es coherente como capacidad del hotel: en ningún día
+    puede ocuparse más del 100% de las habitaciones, así que la suma de
+    ocupadas de todas las repeticiones no puede superar capacidad × repeticiones
+    (con 15% de margen por redondeos). Exige además un valor plausible como
+    número de habitaciones (1-500): sin este límite, una columna de teléfonos
+    u otro número grande "pasaría" la prueba de forma trivial (nunca la supera
+    la ocupación). Devuelve (validables, correctas)."""
+    tope = max(max_repeticiones, 1) * 1.15
+    validables = correctas = 0
+    for valor_col, ocupadas in zip(df[col], ocupadas_totales):
+        capacidad = _a_entero(valor_col)
+        if capacidad is None or not (0 < capacidad <= CAPACIDAD_MAXIMA_PLAUSIBLE) or ocupadas <= 0:
+            continue
+        validables += 1
+        if ocupadas <= capacidad * tope:
+            correctas += 1
+    return validables, correctas
+
+
 def detectar_columnas(df):
     """Ubica las columnas clave por contenido, tolerando que su posición
     cambie entre versiones del formulario. Devuelve un dict con los nombres
@@ -149,8 +189,45 @@ def detectar_columnas(df):
     col_habitaciones = None
     if col_parroquia:
         idx = columnas.index(col_parroquia)
-        if idx + 1 < len(columnas):
-            col_habitaciones = columnas[idx + 1]
+        candidata_posicional = columnas[idx + 1] if idx + 1 < len(columnas) else None
+
+        # La columna de habitaciones disponibles no siempre queda justo después de la
+        # parroquia (visto en el export de Salinas de agosto/2026, donde ahí cae el
+        # nombre del establecimiento). Se valida el supuesto por CONTENIDO: ningún día
+        # puede tener más habitaciones ocupadas que la capacidad declarada; si la
+        # columna vecina no lo cumple, se busca entre las demás columnas numéricas
+        # del bloque de identificación la que sí lo cumpla.
+        ocupadas_totales, n_repeticiones = _totales_ocupadas_por_fila(df, columnas)
+        col_habitaciones = candidata_posicional
+        if candidata_posicional is not None and n_repeticiones > 0:
+            validables, correctas = _validar_columna_habitaciones(
+                df, candidata_posicional, ocupadas_totales, n_repeticiones)
+            # validables < 3 también es sospechoso: si la columna fuera realmente la capacidad,
+            # casi todas las filas con datos de ocupación deberían poder validarse contra ella
+            # (valor numérico positivo). Pocas filas validables suele significar que la columna
+            # ni siquiera es numérica (p. ej. cayó sobre el nombre del establecimiento).
+            if validables < 3 or correctas / validables < 0.8:
+                usadas = {col_parroquia, candidata_posicional}
+                mejor_col, mejor_score, mejor_validables = None, 0.0, 0
+                for c in columnas[idx:idx + 15]:  # bloque de identificación, no todo el archivo
+                    if c in usadas or str(c).startswith(('_', 'meta/', 'start', 'end')):
+                        continue
+                    v, k = _validar_columna_habitaciones(df, c, ocupadas_totales, n_repeticiones)
+                    if v >= 3 and k / v >= 0.8 and k / v > mejor_score:
+                        mejor_col, mejor_score, mejor_validables = c, k / v, v
+                if mejor_col is not None:
+                    advertencias.append(
+                        f"La columna de habitaciones disponibles no estaba donde se esperaba "
+                        f"(versión de formulario distinta); se ubicó por contenido y se usaron "
+                        f"esos valores en su lugar."
+                    )
+                    col_habitaciones = mejor_col
+                else:
+                    advertencias.append(
+                        "No se pudo confirmar con certeza la columna de habitaciones disponibles "
+                        "en este archivo (versión de formulario no reconocida); los porcentajes de "
+                        "ocupación de este archivo pueden no ser confiables - revísalos."
+                    )
     else:
         advertencias.append(
             "No se pudo identificar la columna de parroquia en este archivo "
@@ -202,8 +279,8 @@ def extraer_registro_dia(row, columnas_todas, columnas_detectadas):
     col_nac = columnas_detectadas['nacionales']
     col_ext = columnas_detectadas['extranjeros']
 
-    nombre_establecimiento = _norm(row[col_nombre]) if col_nombre else ''
-    parroquia = _norm(row[col_parroquia]).title() if col_parroquia and pd.notna(row[col_parroquia]) else None
+    nombre_establecimiento = _reparar_mojibake(_norm(row[col_nombre])) if col_nombre else ''
+    parroquia = _reparar_mojibake(_norm(row[col_parroquia])).title() if col_parroquia and pd.notna(row[col_parroquia]) else None
     habitaciones_disponibles = _a_entero(row[col_hab]) if col_hab else None
     nacionales = _a_entero(row[col_nac]) if col_nac else 0
     extranjeros = _a_entero(row[col_ext]) if col_ext else 0
@@ -242,9 +319,16 @@ def extraer_registro_dia(row, columnas_todas, columnas_detectadas):
         'parroquia': parroquia,
         'checkin_nacionales': nacionales or 0,
         'checkin_extranjeros': extranjeros or 0,
+        # total_turistas: el backend lo calcula solo cuando se inserta por Sequelize (hooks
+        # beforeCreate/beforeUpdate), pero el ETL inserta con SQL directo y esos hooks no corren.
+        # Se calcula aquí para no dejarlo en 0.
+        'total_turistas': (nacionales or 0) + (extranjeros or 0),
         'pernoctaciones': total_pernoctaciones,
         'habitaciones_ocupadas': total_habitaciones_ocupadas,
         'habitaciones_disponibles': habitaciones_disponibles or 0,
+        # habitaciones_totales: no es un dato que traiga el formulario aparte; se usa el mismo
+        # valor de habitaciones_disponibles (la capacidad que el hotel reportó ese día).
+        'habitaciones_totales': habitaciones_disponibles or 0,
         'tarifa_cobrada': tarifa_promedio,
         'ocupacion_porcentaje': ocupacion_porcentaje
     }
@@ -271,7 +355,7 @@ def procesar_establecimientos(df, get_db_connection):
 
     connection = get_db_connection()
     cursor = connection.cursor()
-    insertados, errores, detalles = 0, 0, []
+    insertados, errores, omitidos, detalles = 0, 0, 0, []
     hoteles_creados = []
 
     try:
@@ -290,17 +374,36 @@ def procesar_establecimientos(df, get_db_connection):
             "VALUES (%s, %s, %s, NOW(), NOW())"
         )
 
+        # uuid_kobo identifica el envío de forma única (columna "_uuid" del export de Kobo). Con
+        # esto, subir dos veces el mismo archivo - o dos exportaciones que se superponen, como
+        # pasó con Salinas en agosto - ya no duplica: la fila se omite si su _uuid ya está.
+        con_uuid = 'uuid_kobo' in columnas_de(cursor, 'ocupacion_hotelera')
+        uuids_existentes = set()
+        if con_uuid:
+            cursor.execute("SELECT uuid_kobo FROM ocupacion_hotelera WHERE uuid_kobo IS NOT NULL")
+            uuids_existentes = {f['uuid_kobo'] for f in cursor.fetchall()}
+        else:
+            advertencias.append(
+                "Reinicia el backend para activar la protección contra cargas duplicadas de este "
+                "archivo (falta la columna ocupacion_hotelera.uuid_kobo)."
+            )
+
         sql = """
         INSERT INTO ocupacion_hotelera
-        (id_hotel, fecha, checkin_nacionales, checkin_extranjeros, pernoctaciones,
-         habitaciones_ocupadas, habitaciones_disponibles, tarifa_cobrada,
-         ocupacion_porcentaje, fuente_dato, created_at)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'Encuesta', NOW())
+        (id_hotel, fecha, checkin_nacionales, checkin_extranjeros, total_turistas, pernoctaciones,
+         habitaciones_ocupadas, habitaciones_disponibles, habitaciones_totales, tarifa_cobrada,
+         ocupacion_porcentaje, fuente_dato, uuid_kobo, created_at)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'Encuesta', %s, NOW())
         """
 
         for index, row in df.iterrows():
             fila_num = int(index) + 2  # +1 por índice 0, +1 por la fila de encabezado
             try:
+                uuid_fila = _norm(row.get('_uuid')) if con_uuid and pd.notna(row.get('_uuid')) else None
+                if uuid_fila and uuid_fila in uuids_existentes:
+                    omitidos += 1
+                    continue
+
                 fecha_dt = _parsear_fecha_start(row.get('start'))
                 if pd.isna(fecha_dt):
                     errores += 1
@@ -348,11 +451,13 @@ def procesar_establecimientos(df, get_db_connection):
                 id_hotel = candidatos[0]
                 cursor.execute(sql, (
                     id_hotel, fecha,
-                    registro['checkin_nacionales'], registro['checkin_extranjeros'],
+                    registro['checkin_nacionales'], registro['checkin_extranjeros'], registro['total_turistas'],
                     registro['pernoctaciones'], registro['habitaciones_ocupadas'],
-                    registro['habitaciones_disponibles'], registro['tarifa_cobrada'],
-                    registro['ocupacion_porcentaje']
+                    registro['habitaciones_disponibles'], registro['habitaciones_totales'],
+                    registro['tarifa_cobrada'], registro['ocupacion_porcentaje'], uuid_fila
                 ))
+                if uuid_fila:
+                    uuids_existentes.add(uuid_fila)  # protege también contra duplicados DENTRO del mismo archivo
                 insertados += 1
             except Exception as e:
                 errores += 1
@@ -374,5 +479,9 @@ def procesar_establecimientos(df, get_db_connection):
             + ("..." if len(hoteles_creados) > 10 else "")
             + ". Revisa/completa sus datos en Hoteles (categoría, contacto, etc.)."
         )
+    if omitidos:
+        advertencias.append(
+            f"{omitidos} fila(s) ya estaban cargadas (mismo envío de Kobo) y se omitieron - no se duplicaron."
+        )
 
-    return {'insertados': insertados, 'errores': errores, 'detalles': detalles, 'advertencias': advertencias}
+    return {'insertados': insertados, 'errores': errores, 'omitidos': omitidos, 'detalles': detalles, 'advertencias': advertencias}
