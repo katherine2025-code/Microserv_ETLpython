@@ -287,6 +287,8 @@ def extraer_registro_dia(row, columnas_todas, columnas_detectadas):
 
     total_pernoctaciones = 0
     total_habitaciones_ocupadas = 0
+    dias_reportados = 0
+    dias_sobre_capacidad = 0
     tarifas = []
 
     for rep in REPETICIONES:
@@ -302,14 +304,21 @@ def extraer_registro_dia(row, columnas_todas, columnas_detectadas):
             total_pernoctaciones += pernoc
         if hab is not None:
             total_habitaciones_ocupadas += hab
+            dias_reportados += 1
+            if habitaciones_disponibles and hab > habitaciones_disponibles:
+                dias_sobre_capacidad += 1  # incoherente: más ocupadas que habitaciones (dato dudoso)
         if tarifa is not None:
             tarifas.append(tarifa)
 
     tarifa_promedio = round(sum(tarifas) / len(tarifas), 2) if tarifas else 0.0
 
-    if habitaciones_disponibles and habitaciones_disponibles > 0:
+    if habitaciones_disponibles and habitaciones_disponibles > 0 and dias_reportados > 0:
+        # %OCC (MINTUR) del período reportado = habitaciones ocupadas / habitaciones disponibles, donde
+        # las disponibles son capacidad x días. Antes se dividía la SUMA de varios días entre la
+        # capacidad de UN solo día, y casi todo hotel quedaba topado en 100%. El tope de 100 solo
+        # protege ante un dato incoherente; esos casos se cuentan en 'dias_sobre_capacidad'.
         ocupacion_porcentaje = round(
-            min(100.0, (total_habitaciones_ocupadas / habitaciones_disponibles) * 100), 2
+            min(100.0, total_habitaciones_ocupadas / (habitaciones_disponibles * dias_reportados) * 100), 2
         )
     else:
         ocupacion_porcentaje = 0.0
@@ -330,7 +339,9 @@ def extraer_registro_dia(row, columnas_todas, columnas_detectadas):
         # valor de habitaciones_disponibles (la capacidad que el hotel reportó ese día).
         'habitaciones_totales': habitaciones_disponibles or 0,
         'tarifa_cobrada': tarifa_promedio,
-        'ocupacion_porcentaje': ocupacion_porcentaje
+        'ocupacion_porcentaje': ocupacion_porcentaje,
+        'dias_reportados': dias_reportados,
+        'dias_sobre_capacidad': dias_sobre_capacidad
     }
 
 
@@ -388,13 +399,26 @@ def procesar_establecimientos(df, get_db_connection):
                 "archivo (falta la columna ocupacion_hotelera.uuid_kobo)."
             )
 
+        con_dias = 'dias_reportados' in columnas_de(cursor, 'ocupacion_hotelera')
+        if not con_dias:
+            advertencias.append(
+                "Reinicia el backend para crear la columna ocupacion_hotelera.dias_reportados "
+                "(sin ella no se guarda cuántos días reportó cada hotel)."
+            )
         sql = """
+        INSERT INTO ocupacion_hotelera
+        (id_hotel, fecha, checkin_nacionales, checkin_extranjeros, total_turistas, pernoctaciones,
+         habitaciones_ocupadas, habitaciones_disponibles, habitaciones_totales, tarifa_cobrada,
+         ocupacion_porcentaje, fuente_dato, uuid_kobo, dias_reportados, created_at)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'Encuesta', %s, %s, NOW())
+        """ if con_dias else """
         INSERT INTO ocupacion_hotelera
         (id_hotel, fecha, checkin_nacionales, checkin_extranjeros, total_turistas, pernoctaciones,
          habitaciones_ocupadas, habitaciones_disponibles, habitaciones_totales, tarifa_cobrada,
          ocupacion_porcentaje, fuente_dato, uuid_kobo, created_at)
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'Encuesta', %s, NOW())
         """
+        filas_sobre_capacidad = 0
 
         for index, row in df.iterrows():
             fila_num = int(index) + 2  # +1 por índice 0, +1 por la fila de encabezado
@@ -449,13 +473,18 @@ def procesar_establecimientos(df, get_db_connection):
                     continue
 
                 id_hotel = candidatos[0]
-                cursor.execute(sql, (
+                valores = [
                     id_hotel, fecha,
                     registro['checkin_nacionales'], registro['checkin_extranjeros'], registro['total_turistas'],
                     registro['pernoctaciones'], registro['habitaciones_ocupadas'],
                     registro['habitaciones_disponibles'], registro['habitaciones_totales'],
                     registro['tarifa_cobrada'], registro['ocupacion_porcentaje'], uuid_fila
-                ))
+                ]
+                if con_dias:
+                    valores.append(registro['dias_reportados'])
+                cursor.execute(sql, tuple(valores))
+                if registro['dias_sobre_capacidad']:
+                    filas_sobre_capacidad += 1
                 if uuid_fila:
                     uuids_existentes.add(uuid_fila)  # protege también contra duplicados DENTRO del mismo archivo
                 insertados += 1
@@ -478,6 +507,12 @@ def procesar_establecimientos(df, get_db_connection):
             + ", ".join(hoteles_creados[:10])
             + ("..." if len(hoteles_creados) > 10 else "")
             + ". Revisa/completa sus datos en Hoteles (categoría, contacto, etc.)."
+        )
+    if filas_sobre_capacidad:
+        advertencias.append(
+            f"Consistencia: {filas_sobre_capacidad} hotel(es) reportaron algún día con más habitaciones "
+            "ocupadas que su capacidad declarada (posible error de digitación). Se cargaron tal cual, "
+            "con el porcentaje topado en 100%; conviene revisarlos."
         )
     if omitidos:
         advertencias.append(

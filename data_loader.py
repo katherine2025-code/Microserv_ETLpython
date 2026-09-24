@@ -55,6 +55,10 @@ def obtener_dataset_ml():
             LEFT JOIN feriados f ON oh.fecha BETWEEN f.fecha_inicio AND f.fecha_fin
             LEFT JOIN variables_estacionales ve ON oh.fecha = ve.fecha
             WHERE oh.ocupacion_porcentaje IS NOT NULL
+              -- habitaciones_disponibles = 0 no es "0% de ocupación real": es que no se conoce la
+              -- capacidad del hotel ese día (el frontend ya lo muestra como "Sin datos", no como 0%).
+              -- Entrenar con estas filas le enseñaría al modelo ceros falsos que no ocurrieron.
+              AND oh.habitaciones_disponibles > 0
             ORDER BY oh.fecha ASC
         """
 
