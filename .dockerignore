@@ -1,0 +1,8 @@
+venv
+.venv
+__pycache__
+.env
+.git
+*.pkl
+modelo_ganador.json
+*.log
