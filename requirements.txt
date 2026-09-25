@@ -10,3 +10,8 @@ python-dotenv==1.0.0
 pydantic==2.5.3
 sqlalchemy==2.0.25
 openpyxl==3.1.2
+# numpy queda fijo en 1.26.3 (arriba) a propósito: prophet instala numpy 2.x por defecto, pero
+# scikit-learn 1.3.2 y xgboost 2.0.3 (los wheels ya compilados de este proyecto) NO son
+# compatibles con numpy 2.x y fallan al importar. Si se reinstala este archivo con pip, instalar
+# numpy==1.26.3 DESPUÉS de prophet (o con --no-deps en prophet) para que no se pise.
+prophet==1.4.0

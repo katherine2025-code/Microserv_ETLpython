@@ -12,6 +12,7 @@ es_festivo se calcula contra la tabla 'feriados' (el insumo interno que ya
 usa el modelo), y es_temporada_alta/factor_estacional contra 'temporadas'.
 """
 from datetime import timedelta
+from decimal import Decimal
 import pymysql
 import os
 from dotenv import load_dotenv
@@ -109,6 +110,16 @@ def generar_variables_estacionales(fecha_inicio, fecha_fin):
         conn.close()
 
 
+def _a_numeros(fila):
+    """pymysql devuelve las columnas DECIMAL (como factor_estacional) como decimal.Decimal, no
+    float - eso llega a los modelos de ML con dtype 'object' en vez de numérico y XGBoost lo
+    rechaza directamente ("must be int, float, bool or category"). Se convierte aquí, en el único
+    lugar de donde salen estos datos, así ningún llamador tiene que acordarse de hacerlo."""
+    if fila is None:
+        return fila
+    return {k: (float(v) if isinstance(v, Decimal) else v) for k, v in fila.items()}
+
+
 def obtener_o_generar(fecha):
     """Devuelve las variables estacionales de una fecha puntual, generándola primero si falta."""
     conn = pymysql.connect(**DB_CONFIG)
@@ -124,7 +135,7 @@ def obtener_o_generar(fecha):
         conn.close()
 
     if fila:
-        return fila
+        return _a_numeros(fila)
 
     generar_variables_estacionales(fecha, fecha)
 
@@ -136,6 +147,6 @@ def obtener_o_generar(fecha):
                 "FROM variables_estacionales WHERE fecha = %s",
                 (fecha,)
             )
-            return cursor.fetchone()
+            return _a_numeros(cursor.fetchone())
     finally:
         conn.close()

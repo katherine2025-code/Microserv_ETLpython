@@ -104,7 +104,9 @@ async def health():
         "service": "ML Service OTS",
         "timestamp": datetime.now().isoformat(),
         "modelo_entrenado": modelo.modelo_entrenado is not None,
-        "precision": float(modelo.metricas.get('precision', 0)) if modelo.modelo_entrenado else None,
+        # modelo.metricas es {'Random Forest': {...}, 'XGBoost': {...}, 'Prophet': {...}}, no un
+        # dict plano con 'precision' - hay que ir a las métricas del modelo GANADOR (nombre_modelo).
+        "precision": float(modelo.metricas.get(modelo.nombre_modelo, {}).get('precision', 0)) if modelo.modelo_entrenado else None,
         "fecha_entrenamiento": getattr(modelo, 'fecha_entrenamiento', None),
         "version": "1.0.0"
     }
@@ -132,7 +134,7 @@ async def get_metrics():
     
     return {
         "entrenado": True,
-        "precision": float(modelo.metricas.get('precision', 85.0)),
+        "precision": float(modelo.metricas.get(modelo.nombre_modelo, {}).get('precision', 0)),
         "total_predicciones": int(total),
         "modelo_usado": str(modelo.nombre_modelo),
         "fecha_entrenamiento": getattr(modelo, 'fecha_entrenamiento', datetime.now().isoformat()),
@@ -152,7 +154,7 @@ async def get_status():
         "service": "ML Service OTS",
         "status": "online",
         "modelo_entrenado": entrenado,
-        "precision": float(modelo.metricas.get('precision', 0)) if entrenado else 0,
+        "precision": float(modelo.metricas.get(modelo.nombre_modelo, {}).get('precision', 0)) if entrenado else 0,
         "fecha_entrenamiento": getattr(modelo, 'fecha_entrenamiento', None),
         "version": "1.0.0",
         "timestamp": datetime.now().isoformat()
@@ -580,8 +582,11 @@ async def predecir_ocupacion(request: PrediccionRequest):
         prediccion_val = modelo.predecir(datos)
         prediccion_float = float(max(0, min(100, prediccion_val)))
         
-        error_estimado = float(modelo.metricas.get('rmse', 5))
-        precision_modelo = float(modelo.metricas.get('precision', 85.0))
+        # modelo.metricas es {'Random Forest': {...}, 'XGBoost': {...}, 'Prophet': {...}}, no un
+        # dict plano - hay que ir a las métricas del modelo que realmente se está usando.
+        metricas_modelo = modelo.metricas.get(modelo.nombre_modelo, {})
+        error_estimado = float(metricas_modelo.get('rmse', 5))
+        precision_modelo = float(metricas_modelo.get('precision', 0))
         
         print(f"✅ Predicción generada: {prediccion_float}%")
 

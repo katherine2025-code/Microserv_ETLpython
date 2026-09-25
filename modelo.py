@@ -7,6 +7,8 @@ from sklearn.preprocessing import LabelEncoder
 import pickle
 import os
 import re
+import json
+from datetime import datetime
 from data_loader import obtener_dataset_ml
 
 try:
@@ -15,6 +17,24 @@ try:
 except ImportError:
     XGBOOST_DISPONIBLE = False
     print("️ XGBoost no está instalado. Ejecuta: pip install xgboost")
+
+try:
+    # Prophet (vía cmdstanpy) busca su DLL de TBB con "where.exe tbb.dll" antes de cargar el
+    # modelo. Si no está en el PATH, "where.exe" imprime su error en el idioma de Windows (aquí,
+    # español, con tildes) y cmdstanpy intenta decodificarlo como UTF-8 y truena con
+    # UnicodeDecodeError - el síntoma visible termina siendo el engañoso "'Prophet' object has no
+    # attribute 'stan_backend'". Se evita el problema agregando esa carpeta al PATH de antemano,
+    # para que "where.exe" la encuentre y no llegue a imprimir ningún error.
+    import cmdstanpy
+    _tbb_dir = os.path.join(cmdstanpy.cmdstan_path(), 'stan', 'lib', 'stan_math', 'lib', 'tbb')
+    if os.path.isdir(_tbb_dir) and _tbb_dir not in os.environ.get('PATH', ''):
+        os.environ['PATH'] = _tbb_dir + os.pathsep + os.environ.get('PATH', '')
+
+    from prophet import Prophet
+    PROPHET_DISPONIBLE = True
+except Exception:
+    PROPHET_DISPONIBLE = False
+    print("️ Prophet no está disponible (revisa que cmdstan esté instalado: python -m cmdstanpy.install_cmdstan)")
 
 
 class ModeloPredictor:
@@ -25,6 +45,7 @@ class ModeloPredictor:
         self.modelo_entrenado = False
         self.archivo_modelo_rf = "modelo_rf_ots.pkl"
         self.archivo_modelo_xgb = "modelo_xgb_ots.pkl"
+        self.archivo_modelo_prophet = "modelo_prophet_ots.pkl"
 
     def preprocesar(self, df):
         """Limpia y prepara los datos para el modelo"""
@@ -157,20 +178,76 @@ class ModeloPredictor:
             }
 
         # ==========================================
+        # MODELO 3: PROPHET (serie de tiempo)
+        # ==========================================
+        # Prophet necesita la fecha real (columna 'ds'), no mes/dia_semana ya derivados -
+        # esos y es_fin_semana se excluyen de los regresores porque Prophet ya modela
+        # estacionalidad semanal/anual a partir de 'ds' internamente; agregarlos de nuevo
+        # sería redundante. Se usa el mismo X_train/X_test (mismas filas de prueba) que
+        # Random Forest y XGBoost para que las 3 métricas sean comparables entre sí.
+        prophet_model = None
+        if PROPHET_DISPONIBLE:
+            print("\n Entrenando Prophet...")
+            try:
+                columnas_regresoras = [c for c in X_train.columns if c not in ('mes', 'dia_semana', 'es_fin_semana')]
+
+                df_prophet_train = pd.DataFrame({
+                    'ds': pd.to_datetime(df.loc[X_train.index, 'fecha']).values,
+                    'y': y_train.values
+                })
+                for c in columnas_regresoras:
+                    df_prophet_train[c] = X_train[c].values
+
+                prophet_model = Prophet()
+                for c in columnas_regresoras:
+                    prophet_model.add_regressor(c)
+                prophet_model.fit(df_prophet_train)
+
+                df_prophet_test = pd.DataFrame({'ds': pd.to_datetime(df.loc[X_test.index, 'fecha']).values})
+                for c in columnas_regresoras:
+                    df_prophet_test[c] = X_test[c].values
+
+                prophet_pred = prophet_model.predict(df_prophet_test)['yhat'].values
+                prophet_metricas = self.calcular_metricas(y_test, prophet_pred)
+
+                with open(self.archivo_modelo_prophet, 'wb') as f:
+                    pickle.dump({'model': prophet_model, 'regresores': columnas_regresoras}, f)
+
+                resultados['Prophet'] = prophet_metricas
+                print(f"    RMSE: {prophet_metricas['rmse']}, Precisión: {prophet_metricas['precision']}%")
+            except Exception as e:
+                print(f"    Error entrenando Prophet: {e}")
+                prophet_model = None
+                resultados['Prophet'] = {'rmse': 0, 'mae': 0, 'r2': 0, 'precision': 0, 'error': str(e)}
+        else:
+            resultados['Prophet'] = {'rmse': 0, 'mae': 0, 'r2': 0, 'precision': 0, 'error': 'Prophet no instalado'}
+
+        # ==========================================
         # COMPARACIÓN Y SELECCIÓN DEL MEJOR
         # ==========================================
         mejor_modelo = 'Random Forest'
-        if XGBOOST_DISPONIBLE:
-            if resultados['XGBoost']['precision'] > resultados['Random Forest']['precision']:
-                mejor_modelo = 'XGBoost'
+        for nombre in ('XGBoost', 'Prophet'):
+            if resultados.get(nombre, {}).get('precision', 0) > resultados[mejor_modelo]['precision']:
+                mejor_modelo = nombre
 
         self.modelos = {
             'Random Forest': rf_model,
-            'XGBoost': xgb_model if XGBOOST_DISPONIBLE else None
+            'XGBoost': xgb_model if XGBOOST_DISPONIBLE else None,
+            'Prophet': {'model': prophet_model, 'regresores': columnas_regresoras} if prophet_model else None
         }
         self.metricas = resultados
         self.nombre_modelo = mejor_modelo
         self.modelo_entrenado = True
+
+        # Se guarda cuál ganó para que, si el proceso se reinicia y solo se recarga el modelo
+        # (cargar_modelo, sin volver a entrenar), se siga usando el ganador real y no el
+        # "Random Forest" por defecto de la clase - antes se perdía este dato al reiniciar.
+        with open('modelo_ganador.json', 'w', encoding='utf-8') as f:
+            json.dump({
+                'nombre_modelo': mejor_modelo,
+                'fecha_entrenamiento': datetime.now().isoformat(),
+                'metricas': resultados
+            }, f)
 
         return {
             'mejor_modelo': mejor_modelo,
@@ -182,16 +259,18 @@ class ModeloPredictor:
         """Genera un resumen comparativo"""
         rf = self.metricas.get('Random Forest', {})
         xgb = self.metricas.get('XGBoost', {})
+        prophet = self.metricas.get('Prophet', {})
 
-        ganador = 'Random Forest'
-        if XGBOOST_DISPONIBLE and xgb.get('precision', 0) > rf.get('precision', 0):
-            ganador = 'XGBoost'
+        candidatos = {'Random Forest': rf, 'XGBoost': xgb, 'Prophet': prophet}
+        ganador = max(candidatos, key=lambda n: candidatos[n].get('precision', 0))
+        precisiones = [c.get('precision', 0) for c in candidatos.values()]
 
         return {
             'ganador': ganador,
             'random_forest': rf,
             'xgboost': xgb,
-            'diferencia_precision': abs(rf.get('precision', 0) - xgb.get('precision', 0))
+            'prophet': prophet,
+            'diferencia_precision': round(max(precisiones) - min(precisiones), 2)
         }
 
     def predecir(self, datos_input):
@@ -209,12 +288,30 @@ class ModeloPredictor:
             datos_input['habitaciones_ocupadas'] = int(datos_input['pernoctaciones']/2)
 
 
-        df_input = pd.DataFrame([datos_input])
-        df_input = self.preprocesar(df_input)
-
         modelo = self.modelos.get(self.nombre_modelo)
         if modelo is None:
             raise ValueError("No hay modelo disponible para predecir")
+
+        # Prophet se guarda como {'model', 'regresores'} en vez de un estimador de sklearn
+        # directo (ver entrenar()): necesita la fecha real como 'ds', no las columnas
+        # mes/dia_semana ya derivadas, así que se maneja aparte del resto.
+        if self.nombre_modelo == 'Prophet':
+            fecha = datos_input.get('fecha_objetivo') or datos_input.get('fecha')
+            if not fecha:
+                raise ValueError("Prophet necesita 'fecha_objetivo' para predecir")
+
+            df_input = pd.DataFrame([datos_input])
+            df_input = self.preprocesar(df_input)
+
+            df_prophet = pd.DataFrame({'ds': pd.to_datetime([fecha])})
+            for c in modelo['regresores']:
+                df_prophet[c] = df_input[c].values if c in df_input.columns else 0
+
+            prediccion = modelo['model'].predict(df_prophet)['yhat'].iloc[0]
+            return max(0, min(100, prediccion))
+
+        df_input = pd.DataFrame([datos_input])
+        df_input = self.preprocesar(df_input)
 
         if hasattr(modelo, 'feature_names_in_'):
             expected_features = modelo.feature_names_in_
@@ -224,7 +321,7 @@ class ModeloPredictor:
                     df_input[col] = 0
 
             df_input = df_input[expected_features]
-        
+
 
         prediccion = modelo.predict(df_input)[0]
         return max(0, min(100, prediccion))
@@ -238,6 +335,19 @@ class ModeloPredictor:
         if os.path.exists(self.archivo_modelo_xgb):
             with open(self.archivo_modelo_xgb, 'rb') as f:
                 self.modelos['XGBoost'] = pickle.load(f)
+
+        if os.path.exists(self.archivo_modelo_prophet):
+            with open(self.archivo_modelo_prophet, 'rb') as f:
+                self.modelos['Prophet'] = pickle.load(f)
+
+        if os.path.exists('modelo_ganador.json'):
+            with open('modelo_ganador.json', 'r', encoding='utf-8') as f:
+                info = json.load(f)
+            if info.get('nombre_modelo') in self.modelos and self.modelos[info['nombre_modelo']] is not None:
+                self.nombre_modelo = info['nombre_modelo']
+                self.fecha_entrenamiento = info.get('fecha_entrenamiento')
+                if info.get('metricas'):
+                    self.metricas = info['metricas']
 
         if self.modelos:
             self.modelo_entrenado = True
