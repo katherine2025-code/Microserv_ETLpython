@@ -22,11 +22,10 @@ Si no se puede anclar alguno de estos puntos, se reporta como advertencia de
 tercera versión futura del formulario no produce datos silenciosamente
 incorrectos.
 
-Cada fila del archivo = un envío de un establecimiento reportando la
-ocupación de UN día (la fecha de la columna 'start'), con hasta 5
-sub-registros (repeticiones 'fila', 'fila_1' .. 'fila_4') que se SUMAN para
-obtener el total de pernoctaciones/habitaciones ocupadas de ese día, y se
-PROMEDIA la tarifa cobrada entre los sub-registros que la reportaron.
+Cada fila del archivo = un envío de un establecimiento reportando los días
+del feriado (Fecha 1..5 = repeticiones 'fila', 'fila_1' .. 'fila_4'). Se
+guarda UNA fila por envío, fechada con 'start', con los totales del período
+y la cantidad de días reportados (ver extraer_registro_dia).
 
 El archivo no trae un id_hotel: trae el nombre real del establecimiento. Si
 ya existe un hotel con ese nombre (normalizado) en `hoteles`, se usa su
@@ -143,9 +142,9 @@ def _detectar_columna_direccion(df, candidatas):
 
 def _totales_ocupadas_por_fila(df, columnas_todas):
     """Suma, por fila, las 'Habitaciones ocupadas' de todas las repeticiones
-    presentes en el archivo (mismo cálculo que extraer_registro_dia, pero
-    vectorizado para validar la columna de habitaciones_disponibles antes de
-    procesar fila por fila). Devuelve (serie_totales, cantidad_de_repeticiones)."""
+    (días) presentes en el archivo, vectorizado, para validar la columna de
+    habitaciones_disponibles antes de procesar fila por fila (la suma se compara
+    contra capacidad × días). Devuelve (serie_totales, cantidad_de_repeticiones)."""
     columnas_rep = [_buscar_columna(columnas_todas, rep, 'Habitaciones ocupadas') for rep in REPETICIONES]
     columnas_rep = [c for c in columnas_rep if c is not None]
     if not columnas_rep:
@@ -249,15 +248,10 @@ def detectar_columnas(df):
             "tampoco se pudo ubicar."
         )
 
-    col_nacionales = next(
-        (c for c in columnas if 'turistas' in str(c).lower() and 'nacional' in str(c).lower()), None
-    )
-    col_extranjeros = next(
-        (c for c in columnas if 'turistas' in str(c).lower() and 'extranjer' in str(c).lower()), None
-    )
-    if not col_nacionales or not col_extranjeros:
+    nacionales_dia, extranjeros_dia = _detectar_columnas_turistas_por_dia(columnas)
+    if not nacionales_dia:
         advertencias.append(
-            "No se encontraron las columnas de turistas nacionales/extranjeros; "
+            "No se encontraron las columnas de turistas por día (nacionales/extranjeros); "
             "se guardarán como 0."
         )
 
@@ -265,25 +259,57 @@ def detectar_columnas(df):
         'nombre': col_nombre,
         'parroquia': col_parroquia,
         'habitaciones_disponibles': col_habitaciones,
-        'nacionales': col_nacionales,
-        'extranjeros': col_extranjeros,
+        'nacionales_dia': nacionales_dia,
+        'extranjeros_dia': extranjeros_dia,
     }, advertencias
 
 
+def _detectar_columnas_turistas_por_dia(columnas):
+    """Las columnas con la CANTIDAD de turistas de cada día del feriado.
+
+    'Pregunta de turistas /Nacionales' y '/Extranjeros' NO son cantidades: son las casillas
+    de selección múltiple (1 = sí recibió, 0 = no), y guardarlas como turistas mostraba
+    siempre "1" en la tabla. Las cantidades vienen justo después: un bloque 'Fecha 1..N' de
+    nacionales seguido de otro 'Fecha 1..N' de extranjeros (Kobo repite la etiqueta, así que
+    pandas las renombra a 'Fecha 1.1' en .xlsx o 'Fecha 1_10' en .csv). Se toman las columnas
+    'Fecha ...' entre la última casilla de turistas y el grupo repetido de ocupación (que
+    empieza con '**'), y se parten en dos mitades iguales. Devuelve ([], []) si no calza."""
+    idx_casillas = [i for i, c in enumerate(columnas) if str(c).lower().startswith('pregunta de turistas')]
+    if not idx_casillas:
+        return [], []
+    bloque = []
+    for c in columnas[idx_casillas[-1] + 1:]:
+        texto = str(c).strip()
+        if texto.startswith('**') or MARCADOR_FORMULARIO in texto:
+            break
+        if texto.startswith('Fecha'):
+            bloque.append(c)
+    if not bloque or len(bloque) % 2:
+        return [], []
+    mitad = len(bloque) // 2
+    return bloque[:mitad], bloque[mitad:]
+
+
+
 def extraer_registro_dia(row, columnas_todas, columnas_detectadas):
-    """A partir de una fila cruda del archivo, arma el registro de ocupación
-    de ESE día (sumando las hasta 5 repeticiones internas del envío)."""
+    """A partir de una fila cruda del archivo, arma el registro de ocupación del envío.
+
+    Cada repetición ('fila', 'fila_1'..'fila_4') es UN DÍA del feriado (Fecha 1..5 en el
+    formulario), no un sub-registro del mismo día. Como el formulario no trae la fecha real
+    de cada día, se guarda una fila por envío con los TOTALES del período (habitaciones
+    ocupadas, pernoctaciones y turistas sumados sobre los días reportados) junto con
+    dias_reportados. El % de ocupación es la fórmula MINTUR sobre el período:
+    ocupadas / (capacidad × días). La tabla del frontend muestra el promedio por día
+    (total / dias_reportados), que es lo comparable con la capacidad del hotel."""
     col_nombre = columnas_detectadas['nombre']
     col_parroquia = columnas_detectadas.get('parroquia')
     col_hab = columnas_detectadas['habitaciones_disponibles']
-    col_nac = columnas_detectadas['nacionales']
-    col_ext = columnas_detectadas['extranjeros']
 
     nombre_establecimiento = _reparar_mojibake(_norm(row[col_nombre])) if col_nombre else ''
     parroquia = _reparar_mojibake(_norm(row[col_parroquia])).title() if col_parroquia and pd.notna(row[col_parroquia]) else None
     habitaciones_disponibles = _a_entero(row[col_hab]) if col_hab else None
-    nacionales = _a_entero(row[col_nac]) if col_nac else 0
-    extranjeros = _a_entero(row[col_ext]) if col_ext else 0
+    nacionales = sum(_a_entero(row[c]) or 0 for c in columnas_detectadas.get('nacionales_dia') or [])
+    extranjeros = sum(_a_entero(row[c]) or 0 for c in columnas_detectadas.get('extranjeros_dia') or [])
 
     total_pernoctaciones = 0
     total_habitaciones_ocupadas = 0
@@ -326,12 +352,12 @@ def extraer_registro_dia(row, columnas_todas, columnas_detectadas):
     return {
         'nombre_establecimiento': nombre_establecimiento,
         'parroquia': parroquia,
-        'checkin_nacionales': nacionales or 0,
-        'checkin_extranjeros': extranjeros or 0,
+        'checkin_nacionales': nacionales,
+        'checkin_extranjeros': extranjeros,
         # total_turistas: el backend lo calcula solo cuando se inserta por Sequelize (hooks
         # beforeCreate/beforeUpdate), pero el ETL inserta con SQL directo y esos hooks no corren.
         # Se calcula aquí para no dejarlo en 0.
-        'total_turistas': (nacionales or 0) + (extranjeros or 0),
+        'total_turistas': nacionales + extranjeros,
         'pernoctaciones': total_pernoctaciones,
         'habitaciones_ocupadas': total_habitaciones_ocupadas,
         'habitaciones_disponibles': habitaciones_disponibles or 0,
