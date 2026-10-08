@@ -272,6 +272,7 @@ def _extraer_hotel(row, fecha_captura):
     de ocupación por cada bloque con fecha."""
     avisos = []
     disponibles = _entero(row, 'num_habitaciones') or 0
+    plazas = _entero(row, 'num_plazas') or 0
     categoria = _texto(row, 'categoria') or ''
     m = re.match(r'^([1-5])\s*estrella', categoria.lower())
 
@@ -305,15 +306,20 @@ def _extraer_hotel(row, fecha_captura):
         ocupadas = _entero(row, f'fecha{n}_habitaciones') or 0
         nacionales_dia = _entero(row, f'fecha{n}_nacionales') or 0
         extranjeros_dia = _entero(row, f'fecha{n}_extranjeros') or 0
+        pernoctaciones = _entero(row, f'fecha{n}_pernoctaciones') or 0
+        # Tasa por plazas = personas alojadas ese día / plazas (capacidad en personas). Sin turistas
+        # desglosados se usan las pernoctaciones del día (cada persona que duerme esa noche = 1).
+        personas = (nacionales_dia + extranjeros_dia) or pernoctaciones
         bloques.append({
             'fecha': fecha,
             'checkin_nacionales': nacionales_dia,
             'checkin_extranjeros': extranjeros_dia,
             'total_turistas': nacionales_dia + extranjeros_dia,
-            'pernoctaciones': _entero(row, f'fecha{n}_pernoctaciones') or 0,
+            'pernoctaciones': pernoctaciones,
             'habitaciones_ocupadas': ocupadas,
             'tarifa_cobrada': _decimal(row, f'fecha{n}_tarifa') or 0.0,
             'ocupacion_porcentaje': round(min(100.0, ocupadas / disponibles * 100), 2) if disponibles > 0 else 0.0,
+            'ocupacion_plazas_porcentaje': round(min(100.0, personas / plazas * 100), 2) if plazas > 0 else None,
         })
 
     return {
@@ -365,9 +371,12 @@ def _sql_ocupacion(columnas_ocupacion):
               'tarifa_cobrada', 'ocupacion_porcentaje']
     if 'feriado' in columnas_ocupacion:
         campos.append('feriado')
+    if 'ocupacion_plazas_porcentaje' in columnas_ocupacion:
+        campos += ['plazas_disponibles', 'ocupacion_plazas_porcentaje']
     marcas = ', '.join(['%s'] * len(campos))
     return (f"INSERT INTO ocupacion_hotelera ({', '.join(campos)}, fuente_dato, created_at) "
-            f"VALUES ({marcas}, 'Encuesta', NOW())"), 'feriado' in columnas_ocupacion
+            f"VALUES ({marcas}, 'Encuesta', NOW())"), 'feriado' in columnas_ocupacion, \
+        'ocupacion_plazas_porcentaje' in columnas_ocupacion
 
 
 # ==========================================================================
@@ -402,7 +411,7 @@ def procesar_encuestas_app(df, tipo_encuesta, get_db_connection):
             columnas_hoteles = columnas_de(cursor, 'hoteles')
             columnas_ocupacion = columnas_de(cursor, 'ocupacion_hotelera')
             sql_crear_hotel, con_canton_hotel = _sql_crear_hotel(columnas_hoteles)
-            sql_ocupacion, con_feriado = _sql_ocupacion(columnas_ocupacion)
+            sql_ocupacion, con_feriado, con_plazas = _sql_ocupacion(columnas_ocupacion)
             if not (con_canton_hotel and con_feriado):
                 advertencias.append(
                     "Reinicia el backend para aplicar la actualización de la base de datos: sin ella no se "
@@ -522,6 +531,8 @@ def procesar_encuestas_app(df, tipo_encuesta, get_db_connection):
                                    b['tarifa_cobrada'], b['ocupacion_porcentaje']]
                         if con_feriado:
                             valores.append(r['feriado'])
+                        if con_plazas:
+                            valores += [r['plazas_disponibles'], b['ocupacion_plazas_porcentaje']]
                         cursor.execute(sql_ocupacion, valores)
                         registros_ocupacion += 1
 

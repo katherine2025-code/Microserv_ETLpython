@@ -177,6 +177,82 @@ def _validar_columna_habitaciones(df, col, ocupadas_totales, max_repeticiones):
     return validables, correctas
 
 
+def _columnas_turistas_por_dia(columnas):
+    """Columnas 'Fecha 1'..'Fecha N' de la pregunta de turistas: el formulario pregunta cuántos
+    turistas nacionales y cuántos extranjeros se alojaron CADA día. Kobo las exporta como dos
+    grupos seguidos con los mismos rótulos (el segundo con sufijo: 'Fecha 1.1' en xlsx, 'Fecha 1_10'
+    en csv): primero el de nacionales, luego el de extranjeros. Los encabezados '##### Fecha N' del
+    grupo de ocupación NO son de este bloque (empiezan con '#'), y puede haber otra 'Fecha N' suelta
+    más adelante: por eso se toman solo tramos de columnas CONTIGUAS numeradas 1, 2, 3...
+    Devuelve (nacionales, extranjeros), cada uno una lista de columnas en orden de día; listas
+    vacías si el archivo no trae el bloque."""
+    tramos, actual, anterior = [], [], None
+    for pos, c in enumerate(columnas):
+        m = re.match(r'^fecha\s*(\d)', str(c).strip().lower())
+        n = int(m.group(1)) if m else None
+        if n is not None and actual and anterior == (pos - 1, n - 1):
+            actual.append(c)
+        else:
+            if actual:
+                tramos.append(actual)
+            actual = [c] if n == 1 else []
+        anterior = (pos, n)
+    if actual:
+        tramos.append(actual)
+    if len(tramos) < 2 or len(tramos[0]) != len(tramos[1]):
+        return [], []
+    return tramos[0], tramos[1]
+
+
+def _personas_por_dia(row, cols_nac, cols_ext):
+    """Turistas alojados (nacionales + extranjeros) en cada día reportado, o [] si no hay datos."""
+    dias = []
+    for c_nac, c_ext in zip(cols_nac, cols_ext):
+        nac, ext = _a_entero(row[c_nac]), _a_entero(row[c_ext])
+        if nac is None and ext is None:
+            continue
+        dias.append((nac or 0) + (ext or 0))
+    return dias
+
+
+PERSONAS_POR_HABITACION_MAX = 10  # dormitorios compartidos de hostal: hasta ~10 camas por habitación
+
+
+def _detectar_columna_plazas(df, columnas, col_hab, cols_nac, cols_ext):
+    """La capacidad en PLAZAS (personas que el establecimiento puede alojar) es una de las preguntas
+    numéricas que siguen a la de habitaciones; su posición cambió entre versiones del formulario
+    (Santa Elena: la inmediata siguiente; Salinas: una más allá). Se elige por CONTENIDO:
+      - una habitación aloja al menos a 1 persona y como mucho a ~10 (habitaciones <= plazas <= 10 x);
+      - en ningún día puede haber más turistas alojados que plazas (15% de margen).
+    Devuelve None si ninguna candidata es coherente: mejor sin tasa por plazas que con una inventada."""
+    if col_hab is None:
+        return None
+    idx = columnas.index(col_hab)
+    mejor_col, mejor_score = None, 0.0
+    for c in columnas[idx + 1:idx + 4]:
+        if str(c).startswith(('_', 'meta/')) or c in cols_nac or c in cols_ext:
+            continue
+        validables = coherentes = caben = con_personas = 0
+        for _, row in df.iterrows():
+            hab, plazas = _a_entero(row[col_hab]), _a_entero(row[c])
+            if not hab or not plazas or hab <= 0 or plazas <= 0:
+                continue
+            validables += 1
+            if hab <= plazas <= hab * PERSONAS_POR_HABITACION_MAX:
+                coherentes += 1
+            personas = _personas_por_dia(row, cols_nac, cols_ext)
+            if personas:
+                con_personas += 1
+                if max(personas) <= plazas * 1.15:
+                    caben += 1
+        if validables < 3 or coherentes / validables < 0.6:
+            continue
+        score = coherentes / validables + (caben / con_personas if con_personas else 0)
+        if score > mejor_score:
+            mejor_col, mejor_score = c, score
+    return mejor_col
+
+
 def detectar_columnas(df):
     """Ubica las columnas clave por contenido, tolerando que su posición
     cambie entre versiones del formulario. Devuelve un dict con los nombres
@@ -261,12 +337,23 @@ def detectar_columnas(df):
             "se guardarán como 0."
         )
 
+    nacionales_dia, extranjeros_dia = _columnas_turistas_por_dia(columnas)
+    col_plazas = _detectar_columna_plazas(df, columnas, col_habitaciones, nacionales_dia, extranjeros_dia)
+    if col_habitaciones and not col_plazas:
+        advertencias.append(
+            "No se identificó con certeza la capacidad en plazas (personas) de los establecimientos; "
+            "la tasa de ocupación por plazas de este archivo queda sin calcular."
+        )
+
     return {
         'nombre': col_nombre,
         'parroquia': col_parroquia,
         'habitaciones_disponibles': col_habitaciones,
+        'plazas_disponibles': col_plazas,
         'nacionales': col_nacionales,
         'extranjeros': col_extranjeros,
+        'nacionales_dia': nacionales_dia,
+        'extranjeros_dia': extranjeros_dia,
     }, advertencias
 
 
@@ -281,9 +368,23 @@ def extraer_registro_dia(row, columnas_todas, columnas_detectadas):
 
     nombre_establecimiento = _reparar_mojibake(_norm(row[col_nombre])) if col_nombre else ''
     parroquia = _reparar_mojibake(_norm(row[col_parroquia])).title() if col_parroquia and pd.notna(row[col_parroquia]) else None
+    col_plazas = columnas_detectadas.get('plazas_disponibles')
+    cols_nac_dia = columnas_detectadas.get('nacionales_dia') or []
+    cols_ext_dia = columnas_detectadas.get('extranjeros_dia') or []
     habitaciones_disponibles = _a_entero(row[col_hab]) if col_hab else None
-    nacionales = _a_entero(row[col_nac]) if col_nac else 0
-    extranjeros = _a_entero(row[col_ext]) if col_ext else 0
+    plazas_disponibles = _a_entero(row[col_plazas]) if col_plazas else None
+    if plazas_disponibles and habitaciones_disponibles and not (
+            habitaciones_disponibles <= plazas_disponibles <= habitaciones_disponibles * PERSONAS_POR_HABITACION_MAX):
+        plazas_disponibles = None  # menos plazas que habitaciones (o absurdo): error de digitación
+    if cols_nac_dia:
+        # Las columnas 'nacionales'/'extranjeros' son las casillas de "¿qué tipo de turistas
+        # recibió?" (valen 1/0), no cantidades: la cantidad real está en el bloque por día.
+        nacionales = sum(_a_entero(row[c]) or 0 for c in cols_nac_dia)
+        extranjeros = sum(_a_entero(row[c]) or 0 for c in cols_ext_dia)
+    else:
+        nacionales = _a_entero(row[col_nac]) if col_nac else 0
+        extranjeros = _a_entero(row[col_ext]) if col_ext else 0
+    personas_por_dia = _personas_por_dia(row, cols_nac_dia, cols_ext_dia)
 
     total_pernoctaciones = 0
     total_habitaciones_ocupadas = 0
@@ -323,6 +424,22 @@ def extraer_registro_dia(row, columnas_todas, columnas_detectadas):
     else:
         ocupacion_porcentaje = 0.0
 
+    # Tasa de ocupación por PLAZAS = personas alojadas / (plazas x días): qué tan lleno está el
+    # establecimiento respecto a cuántas personas puede alojar (no es lo mismo que la tasa por
+    # habitaciones: una habitación de 4 camas con 1 huésped cuenta como ocupada, pero solo usa 1
+    # de 4 plazas). Personas alojadas = turistas nacionales + extranjeros de cada día; si el archivo
+    # no trae ese bloque, las pernoctaciones del día (cada persona que duerme esa noche = 1).
+    if personas_por_dia:
+        personas_alojadas, dias_personas = sum(personas_por_dia), len(personas_por_dia)
+    else:
+        personas_alojadas, dias_personas = total_pernoctaciones, dias_reportados
+    if plazas_disponibles and plazas_disponibles > 0 and dias_personas > 0:
+        ocupacion_plazas_porcentaje = round(
+            min(100.0, personas_alojadas / (plazas_disponibles * dias_personas) * 100), 2
+        )
+    else:
+        ocupacion_plazas_porcentaje = None
+
     return {
         'nombre_establecimiento': nombre_establecimiento,
         'parroquia': parroquia,
@@ -340,6 +457,8 @@ def extraer_registro_dia(row, columnas_todas, columnas_detectadas):
         'habitaciones_totales': habitaciones_disponibles or 0,
         'tarifa_cobrada': tarifa_promedio,
         'ocupacion_porcentaje': ocupacion_porcentaje,
+        'plazas_disponibles': plazas_disponibles,
+        'ocupacion_plazas_porcentaje': ocupacion_plazas_porcentaje,
         'dias_reportados': dias_reportados,
         'dias_sobre_capacidad': dias_sobre_capacidad
     }
@@ -405,19 +524,21 @@ def procesar_establecimientos(df, get_db_connection):
                 "Reinicia el backend para crear la columna ocupacion_hotelera.dias_reportados "
                 "(sin ella no se guarda cuántos días reportó cada hotel)."
             )
-        sql = """
-        INSERT INTO ocupacion_hotelera
-        (id_hotel, fecha, checkin_nacionales, checkin_extranjeros, total_turistas, pernoctaciones,
-         habitaciones_ocupadas, habitaciones_disponibles, habitaciones_totales, tarifa_cobrada,
-         ocupacion_porcentaje, fuente_dato, uuid_kobo, dias_reportados, created_at)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'Encuesta', %s, %s, NOW())
-        """ if con_dias else """
-        INSERT INTO ocupacion_hotelera
-        (id_hotel, fecha, checkin_nacionales, checkin_extranjeros, total_turistas, pernoctaciones,
-         habitaciones_ocupadas, habitaciones_disponibles, habitaciones_totales, tarifa_cobrada,
-         ocupacion_porcentaje, fuente_dato, uuid_kobo, created_at)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'Encuesta', %s, NOW())
-        """
+        con_plazas = 'ocupacion_plazas_porcentaje' in columnas_de(cursor, 'ocupacion_hotelera')
+        if not con_plazas:
+            advertencias.append(
+                "Reinicia el backend para crear las columnas de ocupación por plazas "
+                "(sin ellas solo se guarda la tasa de ocupación por habitaciones)."
+            )
+        campos = ['id_hotel', 'fecha', 'checkin_nacionales', 'checkin_extranjeros', 'total_turistas',
+                  'pernoctaciones', 'habitaciones_ocupadas', 'habitaciones_disponibles',
+                  'habitaciones_totales', 'tarifa_cobrada', 'ocupacion_porcentaje', 'uuid_kobo']
+        if con_dias:
+            campos.append('dias_reportados')
+        if con_plazas:
+            campos += ['plazas_disponibles', 'ocupacion_plazas_porcentaje']
+        sql = (f"INSERT INTO ocupacion_hotelera ({', '.join(campos)}, fuente_dato, created_at) "
+               f"VALUES ({', '.join(['%s'] * len(campos))}, 'Encuesta', NOW())")
         filas_sobre_capacidad = 0
 
         for index, row in df.iterrows():
@@ -482,7 +603,16 @@ def procesar_establecimientos(df, get_db_connection):
                 ]
                 if con_dias:
                     valores.append(registro['dias_reportados'])
+                if con_plazas:
+                    valores += [registro['plazas_disponibles'], registro['ocupacion_plazas_porcentaje']]
                 cursor.execute(sql, tuple(valores))
+                if registro['plazas_disponibles']:
+                    # La capacidad en plazas es un dato del establecimiento: se completa en su ficha
+                    # si todavía no la tiene (no pisa un valor que el administrador haya cargado).
+                    cursor.execute(
+                        "UPDATE hoteles SET plazas_disponibles = %s WHERE id_hotel = %s AND plazas_disponibles IS NULL",
+                        (registro['plazas_disponibles'], id_hotel)
+                    )
                 if registro['dias_sobre_capacidad']:
                     filas_sobre_capacidad += 1
                 if uuid_fila:

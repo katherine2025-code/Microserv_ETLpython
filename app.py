@@ -34,17 +34,25 @@ app = FastAPI(
 # ==========================================
 # CONFIGURACIÓN CORS ACTUALIZADA
 # ==========================================
+# Orígenes permitidos: los localhost para desarrollo + los dominios de producción (backend y front)
+# ya desplegados. Se pueden ampliar sin tocar el código con la variable de entorno CORS_ORIGINS
+# (lista separada por comas), útil si un dominio cambia al recrear la app en el servidor.
+_origenes = [
+    "http://localhost:3000",   # Backend Node.js (desarrollo)
+    "http://localhost:8100",   # Frontend Ionic (desarrollo)
+    "http://localhost:8101",   # Frontend Ionic (desarrollo)
+    "http://localhost:5000",   # Este mismo servicio (desarrollo)
+    "http://127.0.0.1:3000",
+    "http://127.0.0.1:8100",
+    "http://127.0.0.1:8101",
+    "https://ots-backend.serverteced.cloud",   # Backend Node.js (producción)
+    "https://ots.serverteced.cloud",           # Frontend (producción)
+]
+_origenes += [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",   # Backend Node.js
-        "http://localhost:8100",   # Frontend Ionic
-        "http://localhost:8101",   # Frontend Ionic
-        "http://localhost:5000",   # Este mismo servicio
-        "http://127.0.0.1:3000",
-        "http://127.0.0.1:8100",
-        "http://127.0.0.1:8101",
-    ],
+    allow_origins=_origenes,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
