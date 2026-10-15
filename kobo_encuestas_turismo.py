@@ -87,15 +87,39 @@ def _parsear_fecha_start(valor):
     return pd.to_datetime(texto, errors='coerce', dayfirst=True, utc=True)
 
 
+_SECCION_RE = re.compile(r'^\s*secc', re.IGNORECASE)
+
+
+def _sin_grupo_seccion(columna) -> str:
+    """Quita el prefijo de GRUPO de sección que Kobo antepone a CADA pregunta en
+    las exportaciones con etiquetas (p. ej. 'SECCIÓN A. PERFIL.../1. ¿Qué edad...').
+    Ese primer segmento es el nombre de la sección del formulario, NO una sub-opción
+    de selección múltiple. Sin quitarlo, la regla de '/' de _columnas_pregunta
+    descartaría TODAS las columnas (todas empiezan con 'SECCIÓN .../') y la encuesta
+    entera entraría vacía a la base - que es justo lo que pasaba con los exports
+    reales de Kobo (abril/mayo/agosto quedaron con todos los campos en su valor por
+    defecto). Lo que queda después del prefijo se evalúa normalmente: si todavía tiene
+    '/', es una verdadera sub-opción/matriz (Pregunta_018/..., satisfacción).
+    'SECCIÓN' puede venir con mojibake ('SECCI�N'), por eso solo se exige que el primer
+    segmento empiece por 'secc'."""
+    s = _norm(columna)
+    partes = s.split('/')
+    if len(partes) > 1 and _SECCION_RE.match(partes[0]):
+        return '/'.join(partes[1:]).strip()
+    return s
+
+
 def _columnas_pregunta(columnas):
     """Columnas candidatas a contener una respuesta de opción: excluye
     metadatos de Kobo, GPS, columnas de sub-opciones de selección múltiple
     (tienen '/' en el nombre, ej. 'Pregunta/Ciudad...') y texto libre que
     podría producir falsos positivos (nombre del encuestador, campos
-    "especifique")."""
+    "especifique"). Se evalúa sobre el nombre SIN el prefijo de grupo de sección
+    (ver _sin_grupo_seccion), pero se devuelve la columna ORIGINAL para poder
+    leer su valor con row.get()."""
     resultado = []
     for c in columnas:
-        texto = str(c)
+        texto = _sin_grupo_seccion(c)
         if texto.startswith(_EXCLUIR_PREFIJOS):
             continue
         if '/' in texto:
@@ -104,6 +128,34 @@ def _columnas_pregunta(columnas):
             continue
         resultado.append(c)
     return resultado
+
+
+def _detectar_col_satisfaccion(columnas):
+    """La pregunta de satisfacción general conserva su texto literal ('nivel de
+    satisfaccion') en todas las exportaciones, pero en el formato con secciones
+    cae bajo un sub-grupo (…/Pregunta_019/…) con dos '/', así que _columnas_pregunta
+    la descarta. Se ubica aquí sobre TODAS las columnas, por su texto."""
+    for c in columnas:
+        if MARCADOR_FORMULARIO in _norm(c).lower():
+            return c
+    return None
+
+
+def _detectar_col_probabilidad(columnas, columnas_pregunta, col_satisfaccion):
+    """probabilidad_retorno no conserva su texto real en ninguna exportación: se
+    asume la PRIMERA columna-pregunta candidata que aparece después de la de
+    satisfacción (mismo criterio que la versión anterior, ver PROBABILIDAD_RETORNO_NOTA)."""
+    if col_satisfaccion is None:
+        return None
+    cols = list(columnas)
+    try:
+        pos_sat = cols.index(col_satisfaccion)
+    except ValueError:
+        return None
+    for c in columnas_pregunta:
+        if cols.index(c) > pos_sat:
+            return c
+    return None
 
 
 def _clasificar(row, columnas, mapeo, ambiguo_si_multiple=False, valor_ambiguo='Otro'):
@@ -232,6 +284,234 @@ FRECUENCIA_MAPEO = {
     'mas de 5 veces': 'Más de 5 veces',
 }
 
+# ============================================================================
+# Preguntas "nuevas" de opción única que SÍ se pueden identificar con certeza
+# (añadidas 2026-10-12). A diferencia de las de arriba (que se clasifican con
+# _clasificar recorriendo TODAS las columnas), estas se extraen por COLUMNA:
+# primero se localiza la columna de cada pregunta (por `firmas`, valores que solo
+# aparecen en ESA pregunta), y luego se lee el valor de esa columna fila por fila.
+# Así se evita el choque entre preguntas que comparten una opción (p. ej.
+# "Vehículo propio" está tanto en transporte de llegada como en el de destino):
+# un recorrido global por contenido le asignaría a las dos la misma columna.
+#
+# `mapeo` es una lista ORDENADA de (substring, etiqueta): se devuelve la etiqueta
+# del PRIMER substring contenido en el valor, por eso van de lo más específico a lo
+# más general (ej. 'muy fácil' antes que 'fácil').
+# NO se incluyen aquí (quedaron pendientes por no ser identificables con certeza):
+# los 5 gastos por rubro (columnas B-F sin etiqueta) y las escalas de "acuerdo".
+PREGUNTAS_COLUMNA = [
+    {
+        'campo': 'con_quien_viaja',
+        'firmas': ['en pareja', 'con amigos', 'con familia', 'tour organizado'],
+        'mapeo': [('tour organizado', 'Tour organizado'), ('con amigos', 'Con amigos/as'),
+                  ('con familia', 'Con familia (incluye niños/as)'), ('en pareja', 'En pareja'),
+                  ('solo/a', 'Solo/a'), ('otro', 'Otro')],
+    },
+    {
+        'campo': 'facilidad_informacion',
+        'firmas': ['muy fácil', 'ni fácil ni difícil', 'muy difícil', 'no busqué información'],
+        'mapeo': [('no busqué', 'No busqué información'), ('muy fácil', 'Muy fácil'),
+                  ('ni fácil ni difícil', 'Ni fácil ni difícil'), ('muy difícil', 'Muy difícil'),
+                  ('difícil', 'Difícil'), ('fácil', 'Fácil')],
+    },
+    {
+        'campo': 'como_organizo',
+        'firmas': ['cuenta propia', 'paquete turístico', 'ayuda de familiares', 'agencia de viajes'],
+        'mapeo': [('cuenta propia', 'Por cuenta propia'), ('paquete turístico', 'Por medio de un paquete turístico'),
+                  ('redes sociales o grupos', 'A través de redes sociales o grupos de viaje'),
+                  ('ayuda de familiares', 'Con ayuda de familiares o amigos en el destino'),
+                  ('agencia de viajes en línea', 'A través de una agencia de viajes en línea (OTA)'),
+                  ('agencia de viajes presencial', 'A través de una agencia de viajes presencial'),
+                  ('otro', 'Otro')],
+    },
+    {
+        'campo': 'anticipacion',
+        'firmas': ['1 a 3 días', '4 a 7 días', '1 a 2 semanas', '3 a 4 semanas', '1 a 2 meses', 'más de 2 meses', 'mismo día'],
+        'mapeo': [('mismo día', 'El mismo día del viaje'), ('1 a 3 días', '1 a 3 días antes'),
+                  ('4 a 7 días', '4 a 7 días antes'), ('1 a 2 semanas', '1 a 2 semanas antes'),
+                  ('3 a 4 semanas', '3 a 4 semanas antes'), ('1 a 2 meses', '1 a 2 meses antes'),
+                  ('más de 2 meses', 'Más de 2 meses antes')],
+    },
+    {
+        'campo': 'transporte_llegada',
+        # Firmas SIN "vehículo propio" (lo comparte con transporte de destino): la columna se
+        # identifica por las opciones exclusivas de llegada, pero el valor "Vehículo propio" sí
+        # se mapea abajo porque ya se lee de la columna correcta.
+        'firmas': ['autobús interprovincial', 'alquiler sin conductor', 'de un familiar',
+                   'turístico contratado', 'avión', 'transporte por app'],
+        'mapeo': [('autobús interprovincial', 'Autobús interprovincial'),
+                  ('alquiler sin conductor', 'Vehículo de alquiler sin conductor'),
+                  ('de un familiar', 'Vehículo de un familiar o amigo'),
+                  ('turístico contratado', 'Transporte turístico contratado'),
+                  ('transporte por app', 'Servicio de transporte por app'),
+                  ('avión', 'Avión'), ('vehículo propio', 'Vehículo propio'), ('otro', 'Otro')],
+    },
+    {
+        'campo': 'tipo_viajero',
+        'firmas': ['gama media', 'gama alta', 'bajo presupuesto', 'mochilero'],
+        'mapeo': [('bajo presupuesto', 'Bajo Presupuesto/Mochilero'), ('mochilero', 'Bajo Presupuesto/Mochilero'),
+                  ('gama media', 'Gama Media'), ('gama alta', 'Gama Alta'), ('lujo', 'Lujo')],
+    },
+    {
+        'campo': 'expectativas',
+        'firmas': ['por debajo de lo esperado', 'igual a lo esperado', 'por encima de lo esperado'],
+        'mapeo': [('muy por debajo', 'Muy por debajo de lo esperado'), ('algo por debajo', 'Algo por debajo de lo esperado'),
+                  ('igual a lo esperado', 'Igual a lo esperado'), ('algo por encima', 'Algo por encima de lo esperado'),
+                  ('muy por encima', 'Muy por encima de lo esperado')],
+    },
+    {
+        # P20 del cuestionario ajustado: rubro en el que está dispuesto a gastar MÁS (opción única).
+        'campo': 'rubro_mayor_gasto',
+        'firmas': ['hoteles de lujo', 'transporte y vuelos', 'experiencias y actividades',
+                   'actividades recreativas', 'compras personales', 'artesan'],
+        'mapeo': [('hoteles de lujo', 'Alojamiento'), ('transporte y vuelos', 'Transporte y vuelos'),
+                  ('experiencias y actividades', 'Experiencias y actividades'),
+                  ('actividades recreativas', 'Actividades recreativas/culturales'),
+                  ('compras personales', 'Compras personales'), ('artesan', 'Recuerdos y artesanías'),
+                  ('alojamiento', 'Alojamiento'), ('gastronomía', 'Gastronomía')],
+    },
+    # ---- Preguntas de SELECCIÓN MÚLTIPLE (tipo='multi'): el valor que guarda Kobo trae varias
+    # opciones pegadas; se extraen todas las reconocidas y se guardan separadas por "; ". ----
+    {
+        'campo': 'actividades_esperadas', 'tipo': 'multi',  # P10
+        'firmas': ['cultura y patrimonio', 'naturaleza y aventura', 'turismo rural', 'turismo deportivo',
+                   'entretenimiento y vida nocturna'],
+        'mapeo': [('ciudad (parques', 'Ciudad'), ('cultura y patrimonio', 'Cultura y Patrimonio'),
+                  ('naturaleza y aventura', 'Naturaleza y Aventura'), ('turismo rural', 'Turismo rural'),
+                  ('sol y playa', 'Sol y playa'), ('gastronomía', 'Gastronomía'),
+                  ('entretenimiento y vida nocturna', 'Entretenimiento y vida nocturna'),
+                  ('ferias', 'Ferias y convenciones'), ('turismo deportivo', 'Turismo deportivo')],
+    },
+    {
+        'campo': 'busco_informacion', 'tipo': 'multi',  # P13
+        'firmas': ['buscadores de internet', 'agencias en línea', 'sitio web del destino',
+                   'opiniones online', 'agentes de viaje'],
+        'mapeo': [('buscadores de internet', 'Buscadores de Internet'), ('agencias en línea', 'Agencias en línea'),
+                  ('agentes de viaje', 'Agentes de viaje tradicionales'), ('opiniones online', 'Opiniones online de turistas'),
+                  ('recomendaciones personales', 'Recomendaciones personales'), ('sitio web del destino', 'Sitio web del destino'),
+                  ('redes sociales', 'Redes sociales')],
+    },
+    {
+        'campo': 'transporte_destino', 'tipo': 'multi',  # P18
+        'firmas': ['transporte público', 'taxi amarillo', 'motorizado alquilado', 'bicicleta'],
+        'mapeo': [('transporte público', 'Transporte público (bus)'), ('taxi amarillo', 'Taxi amarillo'),
+                  ('motorizado alquilado', 'Vehículo motorizado alquilado'),
+                  ('motorizado familiar', 'Vehículo motorizado familiar o amigo'),
+                  ('uber', 'Uber u otras apps'), ('bicicleta', 'Bicicleta'), ('caminando', 'Caminando'),
+                  ('vehículo propio', 'Vehículo propio')],
+    },
+    {
+        'campo': 'motivos_recomendacion', 'tipo': 'multi',  # P26
+        'firmas': ['cumplieron con mis necesidades', 'fácil encontrar servicios', 'diversificados',
+                   'facilidades y equipamientos', 'seguridad durante'],
+        'mapeo': [('cumplieron con mis necesidades', 'Servicios cumplieron necesidades'),
+                  ('fácil encontrar servicios', 'Fácil encontrar servicios'),
+                  ('diversificados', 'Atractivos diversificados'),
+                  ('seguridad durante', 'Seguridad durante la estadía'),
+                  ('facilidades y equipamientos', 'Facilidades y equipamientos')],
+    },
+]
+
+# Bloque de gasto por rubro (P19): 6 columnas contiguas A-F. A = la columna con "presupuesto
+# total" en el encabezado; B-F son las 5 siguientes, en el orden del cuestionario ajustado
+# (11-09-2026): A.Alojamiento, B.Alimentación, C.Transporte interno, D.Entretenimiento,
+# E.Compras, F.Recuerdos. El `gasto_total` se recalcula como la SUMA de los 6 (punto medio de
+# cada rango), que es el gasto diario real por persona — antes `gasto_total` guardaba solo la
+# columna A (alojamiento), no el total.
+GASTO_RUBROS = ['gasto_alojamiento', 'gasto_alimentacion', 'gasto_transporte',
+                'gasto_entretenimiento', 'gasto_compras', 'gasto_recuerdos']
+GASTO_MAPEO_ORD = [('0 (sin gasto', 0.0), ('menos de $20', 10.0), ('de $21 a $50', 35.0),
+                   ('de $51 a $100', 75.0), ('más de $200', 250.0), ('mas de $200', 250.0),
+                   ('más de $100', 150.0), ('mas de $100', 150.0)]
+
+
+def _detectar_bloque_gasto(columnas):
+    """Devuelve {campo_rubro: columna} para las 6 columnas A-F del gasto, en orden."""
+    cols = list(columnas)
+    idxA = next((i for i, c in enumerate(cols)
+                 if 'presupuesto total' in _reparar_mojibake(_norm(c)).lower()), None)
+    if idxA is None or idxA + 6 > len(cols):
+        return {}
+    return dict(zip(GASTO_RUBROS, cols[idxA:idxA + 6]))
+
+
+def _mapear_multi(valor, mapeo):
+    """Para preguntas de selección múltiple: devuelve todas las opciones reconocidas dentro del
+    valor (que trae varias pegadas), sin repetir y separadas por '; '. None si nada calza."""
+    if not _valor_valido(valor):
+        return None
+    texto = _reparar_mojibake(_norm(valor)).lower()
+    seleccionadas = []
+    for substr, etiqueta in mapeo:
+        if substr in texto and etiqueta not in seleccionadas:
+            seleccionadas.append(etiqueta)
+    return '; '.join(seleccionadas) if seleccionadas else None
+
+# Matriz de satisfacción por aspecto (escala 1-5). Se identifican por el TEXTO del
+# encabezado (único y estable entre versiones del formulario), no por posición.
+MATRIZ_SATISFACCION = {
+    'satisfaccion_informacion': 'información turística',
+    'satisfaccion_atencion': 'atención y amabilidad',
+    'satisfaccion_seguridad': 'seguridad percibida',
+    'satisfaccion_limpieza': 'limpieza y mantenimiento',
+    'satisfaccion_calidad_precio': 'calidad-precio',
+}
+
+CAMPOS_NUEVOS_TEXTO = [q['campo'] for q in PREGUNTAS_COLUMNA]
+CAMPOS_NUEVOS_ESCALA = list(MATRIZ_SATISFACCION.keys())
+
+
+def _mapear_valor(valor, mapeo):
+    """Devuelve la etiqueta del primer (substring, etiqueta) de `mapeo` contenido en
+    el valor; None si la celda no es válida o nada calza."""
+    if not _valor_valido(valor):
+        return None
+    texto = _norm(valor).lower()
+    for substr, etiqueta in mapeo:
+        if substr in texto:
+            return etiqueta
+    return None
+
+
+def _asignar_columnas_nuevas(df, columnas_pregunta):
+    """Para cada pregunta de PREGUNTAS_COLUMNA busca la columna cuyos valores calzan
+    más veces con sus `firmas`, asignando cada columna a una sola pregunta (evita que
+    dos preguntas con una opción compartida terminen en la misma columna). Devuelve
+    {campo: nombre_columna}."""
+    series = {}
+    for c in columnas_pregunta:
+        try:
+            series[c] = df[c].dropna().astype(str).str.lower()
+        except Exception:
+            series[c] = None
+    umbral = max(3, int(0.02 * len(df)))  # evita falsos positivos por un par de celdas sueltas
+    usadas = set()
+    asignacion = {}
+    for q in PREGUNTAS_COLUMNA:
+        mejor, mejor_score = None, 0
+        for c in columnas_pregunta:
+            if c in usadas or series.get(c) is None or len(series[c]) == 0:
+                continue
+            s = series[c]
+            score = int(s.apply(lambda t: any(f in t for f in q['firmas'])).sum())
+            if score > mejor_score:
+                mejor, mejor_score = c, score
+        if mejor is not None and mejor_score >= umbral:
+            asignacion[q['campo']] = mejor
+            usadas.add(mejor)
+    return asignacion
+
+
+def _detectar_matriz_satisfaccion(columnas):
+    """{campo: columna} para los aspectos de MATRIZ_SATISFACCION, por texto de encabezado."""
+    res = {}
+    for campo, texto in MATRIZ_SATISFACCION.items():
+        for c in columnas:
+            if texto in _reparar_mojibake(_norm(c)).lower():
+                res[campo] = c
+                break
+    return res
+
 
 def _detectar_columna_lugares(columnas):
     """La pregunta de lugares visitados se identifica por CONTENIDO del encabezado (aparece con
@@ -287,8 +567,23 @@ def _extraer_pais(row, columnas):
     return None
 
 
-def extraer_registro(row, columnas_pregunta, idx_nivel_satisfaccion):
-    """A partir de una fila cruda, clasifica cada campo por contenido."""
+def _primer_digito(valor):
+    """Las respuestas de escala vienen como '4' o '1 - Muy improbable'; se toma el
+    primer dígito. Devuelve None si la celda no es válida o no tiene dígitos."""
+    if not _valor_valido(valor):
+        return None
+    m = re.search(r'\d', _norm(valor))
+    return int(m.group()) if m else None
+
+
+def extraer_registro(row, columnas_pregunta, col_satisfaccion, col_probabilidad,
+                     cols_nuevas=None, cols_matriz=None, cols_gasto=None):
+    """A partir de una fila cruda, clasifica cada campo por contenido.
+    `cols_nuevas` ({campo: columna}), `cols_matriz` ({campo: columna}) y `cols_gasto`
+    ({campo_rubro: columna}) vienen precalculados por archivo."""
+    cols_nuevas = cols_nuevas or {}
+    cols_matriz = cols_matriz or {}
+    cols_gasto = cols_gasto or {}
     genero = _clasificar(row, columnas_pregunta, GENERO_MAPEO, ambiguo_si_multiple=True)
     edad = _clasificar(row, columnas_pregunta, EDAD_MAPEO)
     pais = _extraer_pais(row, columnas_pregunta)
@@ -300,24 +595,10 @@ def extraer_registro(row, columnas_pregunta, idx_nivel_satisfaccion):
     frecuencia = _clasificar(row, columnas_pregunta, FRECUENCIA_MAPEO)
     tamano_grupo = _extraer_tamano_grupo(row, columnas_pregunta)
 
-    nivel_satisfaccion = None
-    probabilidad_retorno = None
-    if idx_nivel_satisfaccion is not None:
-        valor_sat = row.get(columnas_pregunta[idx_nivel_satisfaccion])
-        if _valor_valido(valor_sat):
-            m = re.search(r'\d', _norm(valor_sat))
-            if m:
-                nivel_satisfaccion = int(m.group())
+    nivel_satisfaccion = _primer_digito(row.get(col_satisfaccion)) if col_satisfaccion else None
+    probabilidad_retorno = _primer_digito(row.get(col_probabilidad)) if col_probabilidad else None
 
-        idx_retorno = idx_nivel_satisfaccion + 1
-        if idx_retorno < len(columnas_pregunta):
-            valor_ret = row.get(columnas_pregunta[idx_retorno])
-            if _valor_valido(valor_ret):
-                m = re.search(r'\d', _norm(valor_ret))
-                if m:
-                    probabilidad_retorno = int(m.group())
-
-    return {
+    registro = {
         'genero': genero or 'Prefiero no responder',
         'edad': edad if edad is not None else 0,
         'pais_residencia': pais or 'Prefiero no responder',
@@ -332,19 +613,53 @@ def extraer_registro(row, columnas_pregunta, idx_nivel_satisfaccion):
         'probabilidad_retorno': probabilidad_retorno if probabilidad_retorno is not None else 0,
     }
 
+    # Preguntas nuevas que se leen de su columna asignada. Las de opción única (tipo 'texto')
+    # devuelven una etiqueta; las de selección múltiple (tipo 'multi') devuelven las opciones
+    # elegidas separadas por "; ".
+    mapeos = {q['campo']: q['mapeo'] for q in PREGUNTAS_COLUMNA}
+    tipos = {q['campo']: q.get('tipo', 'texto') for q in PREGUNTAS_COLUMNA}
+    for campo in CAMPOS_NUEVOS_TEXTO:
+        col = cols_nuevas.get(campo)
+        if tipos[campo] == 'multi':
+            valor = _mapear_multi(row.get(col), mapeos[campo]) if col else None
+        else:
+            valor = _mapear_valor(row.get(col), mapeos[campo]) if col else None
+        registro[campo] = valor or 'Prefiero no responder'
+    # Matriz de satisfacción por aspecto (escala 1-5; 0 = sin dato, como nivel_satisfaccion).
+    for campo in CAMPOS_NUEVOS_ESCALA:
+        col = cols_matriz.get(campo)
+        valor = _primer_digito(row.get(col)) if col else None
+        registro[campo] = valor if valor is not None else 0
+
+    # Gasto por rubro (P19, 6 columnas) + recálculo de gasto_total = suma de los 6 (punto medio
+    # de cada rango). Si no se detectó el bloque, se conserva el gasto_total de arriba (columna A).
+    suma, hay_gasto = 0.0, False
+    for campo in GASTO_RUBROS:
+        col = cols_gasto.get(campo)
+        val = _mapear_valor(row.get(col), GASTO_MAPEO_ORD) if col else None
+        registro[campo] = val if val is not None else 0.0
+        if val is not None:
+            suma += val
+            hay_gasto = True
+    if hay_gasto:
+        registro['gasto_total'] = suma
+
+    return registro
+
 
 def procesar_encuestas_turismo(df, get_db_connection):
     """Procesa el DataFrame crudo (tal cual lo entrega leer_archivo) e
     inserta en encuestas_turisticas."""
     columnas_pregunta = _columnas_pregunta(df.columns)
-    idx_nivel_satisfaccion = next(
-        (i for i, c in enumerate(columnas_pregunta) if MARCADOR_FORMULARIO in _norm(c).lower()),
-        None
-    )
+    col_satisfaccion = _detectar_col_satisfaccion(df.columns)
+    col_probabilidad = _detectar_col_probabilidad(df.columns, columnas_pregunta, col_satisfaccion)
     col_lugares = _detectar_columna_lugares(df.columns)
+    cols_nuevas = _asignar_columnas_nuevas(df, columnas_pregunta)
+    cols_matriz = _detectar_matriz_satisfaccion(df.columns)
+    cols_gasto = _detectar_bloque_gasto(df.columns)
 
     advertencias = []
-    if idx_nivel_satisfaccion is None:
+    if col_satisfaccion is None:
         advertencias.append(
             "No se pudo ubicar la pregunta de satisfacción general; "
             "nivel_satisfaccion y probabilidad_retorno quedarán en 0."
@@ -386,6 +701,9 @@ def procesar_encuestas_turismo(df, get_db_connection):
                   'nivel_educativo', 'ocupacion', 'tamano_grupo', 'frecuencia_visitas',
                   'motivo_visita', 'noches_estadia', 'gasto_total', 'nivel_satisfaccion',
                   'probabilidad_retorno']
+        # Campos nuevos (2026-10): solo si ya existen en la BD (requiere la migración de columnas).
+        campos_nuevos_presentes = [c for c in (CAMPOS_NUEVOS_TEXTO + CAMPOS_NUEVOS_ESCALA + GASTO_RUBROS) if c in columnas_bd]
+        campos.extend(campos_nuevos_presentes)
         if con_lugares:
             campos.append('lugares_visitados')
         if con_uuid:
@@ -409,7 +727,8 @@ def procesar_encuestas_turismo(df, get_db_connection):
                     continue
                 fecha = fecha_dt.strftime('%Y-%m-%d')
 
-                registro = extraer_registro(row, columnas_pregunta, idx_nivel_satisfaccion)
+                registro = extraer_registro(row, columnas_pregunta, col_satisfaccion,
+                                            col_probabilidad, cols_nuevas, cols_matriz, cols_gasto)
 
                 valores = [
                     fecha, registro['genero'], registro['edad'], registro['pais_residencia'],
@@ -419,6 +738,7 @@ def procesar_encuestas_turismo(df, get_db_connection):
                     registro['noches_estadia'], registro['gasto_total'],
                     registro['nivel_satisfaccion'], registro['probabilidad_retorno']
                 ]
+                valores.extend(registro[c] for c in campos_nuevos_presentes)
                 if con_lugares:
                     lugares = extraer_lugares(row.get(col_lugares)) if col_lugares else []
                     valores.append(json.dumps(lugares, ensure_ascii=False))

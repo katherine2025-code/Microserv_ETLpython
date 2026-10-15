@@ -30,6 +30,8 @@ from cantones import canton_de_parroquia, normalizar_canton, columnas_de
 from kobo_encuestas_turismo import (
     EDAD_MAPEO, PAIS_MAPEO, NOCHES_MAPEO, GASTO_MAPEO,
     NIVEL_EDUCATIVO_MAPEO, OCUPACION_MAPEO, FRECUENCIA_MAPEO,
+    PREGUNTAS_COLUMNA, GASTO_RUBROS, GASTO_MAPEO_ORD, MATRIZ_SATISFACCION,
+    CAMPOS_NUEVOS_ESCALA, _mapear_valor, _mapear_multi,
 )
 
 COLUMNAS_MARCADOR = ('tipo_encuesta', 'fecha_encuesta')
@@ -49,8 +51,20 @@ MOTIVOS_APP = {
     'estudios o formación': 'Estudios o formación',
     'salud o tratamiento médico': 'Salud o tratamiento médico',
 }
-COLUMNAS_GASTO = ['gasto_transporte', 'gasto_alojamiento', 'gasto_alimentacion',
-                  'gasto_actividades', 'gasto_compras']
+# Cuestionario ajustado (11-09-2026): 6 rubros de gasto A-F. El código de la pregunta en la app
+# coincide 1:1 con la columna de encuestas_turisticas (GASTO_RUBROS), por eso se leen por nombre.
+COLUMNAS_GASTO = list(GASTO_RUBROS)  # gasto_alojamiento, _alimentacion, _transporte, _entretenimiento, _compras, _recuerdos
+
+# Preguntas "nuevas" de opción única / múltiple: mapea el CÓDIGO de la pregunta en la app ->
+# (columna BD, mapeo canónico, tipo). Se reutilizan los mapeos del parser de Kobo para que un
+# mismo concepto quede con la MISMA etiqueta venga de donde venga (consistencia). El único
+# código que difiere del nombre de columna es 'actividades' -> columna 'actividades_esperadas'.
+_CODIGO_APP = {'actividades_esperadas': 'actividades'}
+PREGUNTAS_APP = [
+    {'codigo': _CODIGO_APP.get(p['campo'], p['campo']), 'columna': p['campo'],
+     'mapeo': p['mapeo'], 'tipo': p.get('tipo', 'texto')}
+    for p in PREGUNTAS_COLUMNA
+]
 
 CAMPOS_TURISTA = ['edad', 'genero', 'pais_residencia', 'educacion', 'ocupacion', 'personas_grupo',
                   'motivo_visita', 'veces_visitado', 'noches_hospedado', 'satisfaccion_atractivos',
@@ -217,50 +231,82 @@ def _extraer_turista(row, cont):
     if noches_txt and noches is None:
         cont.sin_mapeo('noches_hospedado')
 
-    # Gasto total = suma de las 5 categorías de gasto (valor medio de cada rango)
-    gasto_total = 0.0
+    # Gasto por rubro (6) + gasto_total = suma de los 6 (valor medio de cada rango). Cada rubro
+    # se guarda además en su propia columna.
+    gasto_total, hay_gasto = 0.0, False
+    rubros = {}
     for campo in COLUMNAS_GASTO:
         texto = _texto(row, campo)
-        if not texto:
-            continue
-        monto = _buscar(texto, GASTO_MAPEO)
-        if monto is None:
-            if 'prefiero no responder' not in texto.lower():
-                cont.sin_mapeo(campo)
-            continue
-        gasto_total += monto
+        monto = _mapear_valor(texto, GASTO_MAPEO_ORD) if texto else None
+        rubros[campo] = monto if monto is not None else 0.0
+        if texto and monto is None and 'prefiero no responder' not in texto.lower():
+            cont.sin_mapeo(campo)
+        if monto is not None:
+            gasto_total += monto
+            hay_gasto = True
 
     def escala(campo):
         texto = _texto(row, campo)
         m = re.search(r'\d', texto) if texto else None
         return int(m.group()) if m else 0  # 'N/A' o vacío -> 0 (convención del ETL)
 
-    return {
+    registro = {
         'genero': genero,
         'edad': edad if edad is not None else 0,
         'pais_residencia': pais,
+        'ciudad_residencia': NO_RESPONDER,  # esta encuesta no pregunta ciudad
         'nivel_educativo': categoria('educacion', NIVEL_EDUCATIVO_MAPEO),
         'ocupacion': categoria('ocupacion', OCUPACION_MAPEO),
         'tamano_grupo': tamano_grupo,
         'frecuencia_visitas': categoria('veces_visitado', FRECUENCIA_MAPEO, maximo=50),
         'motivo_visita': motivo,
         'noches_estadia': noches if noches is not None else 0,
-        'gasto_total': round(gasto_total, 2),
+        'gasto_total': round(gasto_total, 2) if hay_gasto else 0.0,
         'nivel_satisfaccion': escala('satisfaccion_atractivos'),
-        # La app pregunta "probabilidad de recomendar el destino" (escala 1-5); es el
+        # La app pregunta "probabilidad de recomendar/volver" (escala 1-5); es el
         # equivalente del indicador de retorno/lealtad que guarda la tabla.
         'probabilidad_retorno': escala('probabilidad_recomendar'),
     }
+    registro.update(rubros)
+
+    # Preguntas nuevas de opción única / múltiple (cuestionario ajustado). Se leen por código y
+    # se normalizan a la etiqueta canónica con el mismo mapeo que el parser de Kobo.
+    for p in PREGUNTAS_APP:
+        texto = _texto(row, p['codigo'])
+        if p['tipo'] == 'multi':
+            valor = _mapear_multi(texto, p['mapeo']) if texto else None
+        else:
+            valor = _mapear_valor(texto, p['mapeo']) if texto else None
+        if texto and valor is None and 'prefiero no responder' not in texto.lower():
+            cont.sin_mapeo(p['codigo'])
+        registro[p['columna']] = valor or NO_RESPONDER
+
+    # Matriz de satisfacción por aspecto (escala 1-5; código = columna).
+    for campo in CAMPOS_NUEVOS_ESCALA:
+        registro[campo] = escala(campo)
+
+    return registro
 
 
-SQL_TURISTA = """
-INSERT INTO encuestas_turisticas
-(fecha_encuesta, genero, edad, pais_residencia, ciudad_residencia,
- nivel_educativo, ocupacion, tamano_grupo, frecuencia_visitas,
- motivo_visita, noches_estadia, gasto_total, nivel_satisfaccion,
- probabilidad_retorno, fecha_registro)
-VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
-"""
+# Orden de columnas para el INSERT de turista. Las nuevas (cuestionario ajustado) solo se
+# incluyen si ya existen en encuestas_turisticas (ver _sql_turista), para no romper si falta
+# la migración de columnas.
+CAMPOS_TURISTA_BASE = ['genero', 'edad', 'pais_residencia', 'ciudad_residencia',
+                       'nivel_educativo', 'ocupacion', 'tamano_grupo', 'frecuencia_visitas',
+                       'motivo_visita', 'noches_estadia', 'gasto_total', 'nivel_satisfaccion',
+                       'probabilidad_retorno']
+CAMPOS_TURISTA_NUEVOS = ([p['columna'] for p in PREGUNTAS_APP]
+                         + list(CAMPOS_NUEVOS_ESCALA) + list(GASTO_RUBROS))
+
+
+def _sql_turista(columnas_bd):
+    """Arma el INSERT de turista incluyendo las columnas nuevas que existan en la BD."""
+    nuevos = [c for c in CAMPOS_TURISTA_NUEVOS if c in columnas_bd]
+    campos = ['fecha_encuesta'] + CAMPOS_TURISTA_BASE + nuevos
+    marcas = ', '.join(['%s'] * len(campos))
+    sql = (f"INSERT INTO encuestas_turisticas ({', '.join(campos)}, fecha_registro) "
+           f"VALUES ({marcas}, NOW())")
+    return sql, nuevos
 
 
 # ==========================================================================
@@ -431,6 +477,18 @@ def procesar_encuestas_app(df, tipo_encuesta, get_db_connection):
                     "Feriados') para que el sistema y el modelo de predicción reconozcan los feriados."
                 )
 
+        sql_turista = campos_turista_nuevos = None
+        if tipo_encuesta == 'turista':
+            columnas_turisticas = columnas_de(cursor, 'encuestas_turisticas')
+            sql_turista, campos_turista_nuevos = _sql_turista(columnas_turisticas)
+            faltan_cols = [c for c in CAMPOS_TURISTA_NUEVOS if c not in columnas_turisticas]
+            if faltan_cols:
+                advertencias.append(
+                    "Reinicia el backend para aplicar la migración de columnas: sin ella no se guardan "
+                    f"{len(faltan_cols)} campos nuevos del cuestionario ajustado (gasto por rubro, "
+                    "actividades, satisfacción por aspecto, etc.)."
+                )
+
         # La marca de "ya cargada" vive en respuestas_encuestas.fecha_etl (la crea el backend
         # al iniciar). Si no existe todavía, se carga igual pero sin protección contra duplicados.
         cursor.execute(
@@ -467,12 +525,9 @@ def procesar_encuestas_app(df, tipo_encuesta, get_db_connection):
 
                 if tipo_encuesta == 'turista':
                     r = _extraer_turista(row, cont)
-                    cursor.execute(SQL_TURISTA, (
-                        fecha, r['genero'], r['edad'], r['pais_residencia'], NO_RESPONDER,
-                        r['nivel_educativo'], r['ocupacion'], r['tamano_grupo'],
-                        r['frecuencia_visitas'], r['motivo_visita'], r['noches_estadia'],
-                        r['gasto_total'], r['nivel_satisfaccion'], r['probabilidad_retorno']
-                    ))
+                    valores = [fecha] + [r[c] for c in CAMPOS_TURISTA_BASE] \
+                              + [r[c] for c in campos_turista_nuevos]
+                    cursor.execute(sql_turista, valores)
                 else:
                     r, avisos = _extraer_hotel(row, fecha)
                     for aviso in avisos:
