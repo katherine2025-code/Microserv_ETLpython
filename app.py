@@ -674,8 +674,8 @@ async def predecir_ocupacion_rango(request: PrediccionRangoRequest):
             raise HTTPException(status_code=400, detail="La fecha de inicio no puede ser posterior a la fecha de fin.")
             
         dias_diferencia = (end_date - start_date).days + 1
-        if dias_diferencia > 60:
-            raise HTTPException(status_code=400, detail="El rango máximo permitido es de 60 días.")
+        if dias_diferencia > 370:
+            raise HTTPException(status_code=400, detail="El rango máximo permitido es de 1 año (370 días).")
             
         connection = get_db_connection()
         cursor = connection.cursor()
