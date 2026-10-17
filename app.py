@@ -17,6 +17,7 @@ from variables_estacionales import generar_variables_estacionales, obtener_o_gen
 from kobo_establecimientos import es_formulario_establecimientos, procesar_establecimientos
 from kobo_encuestas_turismo import es_formulario_turismo, procesar_encuestas_turismo
 from ots_app_encuestas import es_csv_app, tipo_encuesta_del_archivo, procesar_encuestas_app
+from parser_encuestas_v2 import es_encuesta_v2, procesar_encuestas_v2
 
 # Configurar logging
 logging.basicConfig(level=logging.INFO)
@@ -222,6 +223,11 @@ async def procesar_csv(file: UploadFile = File(...), tipo: str = Form(None)):
         elif tipo == 'ocupacion' and es_formulario_establecimientos(df_crudo.columns):
             print("📋 Formulario detectado: Establecimientos de Alojamiento (Kobo)")
             resultado = procesar_establecimientos(df_crudo, get_db_connection)
+            advertencias = resultado.get('advertencias', [])
+            total_registros = len(df_crudo)
+        elif tipo == 'encuestas' and es_encuesta_v2(df_crudo.columns):
+            print("📋 Formato detectado: Encuesta Turística v2 (nombres de variable + GPS)")
+            resultado = procesar_encuestas_v2(df_crudo, get_db_connection)
             advertencias = resultado.get('advertencias', [])
             total_registros = len(df_crudo)
         elif tipo == 'encuestas' and es_formulario_turismo(df_crudo.columns):
