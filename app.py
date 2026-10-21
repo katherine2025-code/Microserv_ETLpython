@@ -1,5 +1,7 @@
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+import hmac
 from pydantic import BaseModel
 from typing import Optional, List
 import pandas as pd
@@ -59,6 +61,32 @@ app.add_middleware(
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
+
+# ==========================================
+# AUTENTICACIÓN ENTRE SERVICIOS
+# ==========================================
+# Este servicio solo lo llama el backend Node.js. Cada petición debe traer el header
+# X-Service-Token con el mismo valor que la variable SERVICE_TOKEN (compartida con el backend).
+# Sin esto, cualquiera que alcanzara el puerto podía entrenar el modelo o cargar datos en la BD.
+# Excepciones: /health (para chequeos de disponibilidad) y los preflight OPTIONS de CORS.
+# Si SERVICE_TOKEN no está configurado, se rechaza todo (falla cerrado, no abierto).
+SERVICE_TOKEN = os.getenv("SERVICE_TOKEN", "")
+RUTAS_PUBLICAS = {"/health"}
+if not SERVICE_TOKEN:
+    logger.warning("SERVICE_TOKEN no está configurado: se rechazarán todas las peticiones salvo /health.")
+
+
+@app.middleware("http")
+async def verificar_token_servicio(request: Request, call_next):
+    if request.method == "OPTIONS" or request.url.path in RUTAS_PUBLICAS:
+        return await call_next(request)
+    if not SERVICE_TOKEN:
+        return JSONResponse(status_code=503, content={"detail": "SERVICE_TOKEN no configurado en el microservicio"})
+    token = request.headers.get("X-Service-Token", "")
+    if not hmac.compare_digest(token.encode(), SERVICE_TOKEN.encode()):
+        return JSONResponse(status_code=401, content={"detail": "Token de servicio inválido o ausente"})
+    return await call_next(request)
+
 
 # Inicializar modelo
 modelo = ModeloPredictor()
