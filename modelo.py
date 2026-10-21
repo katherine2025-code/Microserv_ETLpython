@@ -8,6 +8,7 @@ import pickle
 import os
 import re
 import json
+import threading
 from datetime import datetime
 from data_loader import obtener_dataset_ml
 
@@ -67,6 +68,19 @@ class ModeloPredictor:
         self.archivo_modelo_xgb = os.path.join(MODEL_DIR, "modelo_xgb_ots.pkl")
         self.archivo_modelo_prophet = os.path.join(MODEL_DIR, "modelo_prophet_ots.pkl")
         self.archivo_ganador = os.path.join(MODEL_DIR, "modelo_ganador.json")
+
+        # Un solo entrenamiento a la vez: el automático del arranque y el manual (POST /entrenar)
+        # comparten este lock. Quien no lo consigue no espera: se rechaza (ver app.py).
+        self.lock_entrenamiento = threading.Lock()
+        self.entrenando = False
+        self.error_entrenamiento = None  # último error del entrenamiento automático/manual
+
+    def estado(self):
+        """'entrenando' (hay un entrenamiento en curso, aunque ya exista un modelo anterior en
+        uso), 'cargado' (hay modelo listo para predecir) o 'ausente'."""
+        if self.entrenando:
+            return 'entrenando'
+        return 'cargado' if self.modelo_entrenado else 'ausente'
 
     def preprocesar(self, df):
         """Limpia y prepara los datos para el modelo"""
