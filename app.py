@@ -10,6 +10,7 @@ import os
 from dotenv import load_dotenv
 import logging
 
+from db_config import DB_CONFIG
 from data_loader import obtener_dataset_ml
 from modelo import ModeloPredictor
 from etl_utils import CANONICAL_SCHEMAS, leer_archivo, mapear_posicional, limpiar_y_convertir
@@ -65,15 +66,7 @@ modelo = ModeloPredictor()
 # ==========================================
 # CONFIGURACIÓN DE BASE DE DATOS
 # ==========================================
-DB_CONFIG = {
-    'host': os.getenv('DB_HOST', '127.0.0.1'),
-    'port': int(os.getenv('DB_PORT', 3306)),
-    'user': os.getenv('DB_USER', 'root'),
-    'password': os.getenv('DB_PASSWORD', 'vidamiaIsa2910.'),
-    'database': os.getenv('DB_NAME', 'ots'),
-    'charset': 'utf8mb4',
-    'cursorclass': pymysql.cursors.DictCursor
-}
+# Ver db_config.py (única fuente de la configuración de BD)
 
 print(f"\n📊 Configuración de BD en Python:")
 print(f"   Host: {DB_CONFIG['host']}")

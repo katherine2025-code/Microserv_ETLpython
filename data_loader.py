@@ -1,22 +1,12 @@
 import pymysql
 import pandas as pd
-import os
-from dotenv import load_dotenv
+from db_config import DB_PARAMS
 from variables_estacionales import generar_variables_estacionales
-
-load_dotenv()
 
 def obtener_dataset_ml():
     """Obtiene el dataset completo para entrenar el modelo ML"""
     try:
-        connection = pymysql.connect(
-            host=os.getenv('DB_HOST', 'localhost'),
-            port=int(os.getenv('DB_PORT', 3306)),
-            user=os.getenv('DB_USER', 'root'),
-            password=os.getenv('DB_PASSWORD', 'vidamiaIsa2910.'),
-            database=os.getenv('DB_NAME', 'ots'),
-            charset='utf8mb4'
-        )
+        connection = pymysql.connect(**DB_PARAMS)
 
         # Asegura que exista una fila de variables_estacionales para cada
         # fecha con datos de ocupación, para que el JOIN de abajo tenga con

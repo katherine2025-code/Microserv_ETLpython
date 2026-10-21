@@ -14,20 +14,7 @@ usa el modelo), y es_temporada_alta/factor_estacional contra 'temporadas'.
 from datetime import timedelta
 from decimal import Decimal
 import pymysql
-import os
-from dotenv import load_dotenv
-
-load_dotenv()
-
-DB_CONFIG = {
-    'host': os.getenv('DB_HOST', '127.0.0.1'),
-    'port': int(os.getenv('DB_PORT', 3306)),
-    'user': os.getenv('DB_USER', 'root'),
-    'password': os.getenv('DB_PASSWORD', ''),
-    'database': os.getenv('DB_NAME', 'ots'),
-    'charset': 'utf8mb4',
-    'cursorclass': pymysql.cursors.DictCursor
-}
+from db_config import DB_CONFIG
 
 # Cuánto se refuerza el factor de temporada cuando la fecha además es feriado.
 BOOST_FESTIVO = 0.1
