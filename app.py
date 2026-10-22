@@ -1,5 +1,7 @@
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+import hmac
 from pydantic import BaseModel
 from typing import Optional, List
 import pandas as pd
@@ -10,6 +12,7 @@ import os
 from dotenv import load_dotenv
 import logging
 
+from db_config import DB_CONFIG
 from data_loader import obtener_dataset_ml
 from modelo import ModeloPredictor
 from etl_utils import CANONICAL_SCHEMAS, leer_archivo, mapear_posicional, limpiar_y_convertir
@@ -59,21 +62,39 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ==========================================
+# AUTENTICACIÓN ENTRE SERVICIOS
+# ==========================================
+# Este servicio solo lo llama el backend Node.js. Cada petición debe traer el header
+# X-Service-Token con el mismo valor que la variable SERVICE_TOKEN (compartida con el backend).
+# Sin esto, cualquiera que alcanzara el puerto podía entrenar el modelo o cargar datos en la BD.
+# Excepciones: /health (para chequeos de disponibilidad) y los preflight OPTIONS de CORS.
+# Si SERVICE_TOKEN no está configurado, se rechaza todo (falla cerrado, no abierto).
+SERVICE_TOKEN = os.getenv("SERVICE_TOKEN", "")
+RUTAS_PUBLICAS = {"/health"}
+if not SERVICE_TOKEN:
+    logger.warning("SERVICE_TOKEN no está configurado: se rechazarán todas las peticiones salvo /health.")
+
+
+@app.middleware("http")
+async def verificar_token_servicio(request: Request, call_next):
+    if request.method == "OPTIONS" or request.url.path in RUTAS_PUBLICAS:
+        return await call_next(request)
+    if not SERVICE_TOKEN:
+        return JSONResponse(status_code=503, content={"detail": "SERVICE_TOKEN no configurado en el microservicio"})
+    token = request.headers.get("X-Service-Token", "")
+    if not hmac.compare_digest(token.encode(), SERVICE_TOKEN.encode()):
+        return JSONResponse(status_code=401, content={"detail": "Token de servicio inválido o ausente"})
+    return await call_next(request)
+
+
 # Inicializar modelo
 modelo = ModeloPredictor()
 
 # ==========================================
 # CONFIGURACIÓN DE BASE DE DATOS
 # ==========================================
-DB_CONFIG = {
-    'host': os.getenv('DB_HOST', '127.0.0.1'),
-    'port': int(os.getenv('DB_PORT', 3306)),
-    'user': os.getenv('DB_USER', 'root'),
-    'password': os.getenv('DB_PASSWORD', 'vidamiaIsa2910.'),
-    'database': os.getenv('DB_NAME', 'ots'),
-    'charset': 'utf8mb4',
-    'cursorclass': pymysql.cursors.DictCursor
-}
+# Ver db_config.py (única fuente de la configuración de BD)
 
 print(f"\n📊 Configuración de BD en Python:")
 print(f"   Host: {DB_CONFIG['host']}")
