@@ -11,10 +11,11 @@ import pymysql
 import os
 from dotenv import load_dotenv
 import logging
+import threading
 
 from db_config import DB_CONFIG
 from data_loader import obtener_dataset_ml
-from modelo import ModeloPredictor
+from modelo import ModeloPredictor, MODEL_DIR
 from etl_utils import CANONICAL_SCHEMAS, leer_archivo, mapear_posicional, limpiar_y_convertir
 from variables_estacionales import generar_variables_estacionales, obtener_o_generar
 from kobo_establecimientos import es_formulario_establecimientos, procesar_establecimientos
@@ -122,7 +123,8 @@ async def root():
         "status": "running",
         "version": "1.0.0",
         "timestamp": datetime.now().isoformat(),
-        "modelo_entrenado": modelo.modelo_entrenado is not None,
+        "modelo_entrenado": modelo.modelo_entrenado,
+        "estado_modelo": modelo.estado(),
         "docs": "/docs"
     }
 
@@ -133,20 +135,26 @@ async def health():
         "status": "OK",
         "service": "ML Service OTS",
         "timestamp": datetime.now().isoformat(),
-        "modelo_entrenado": modelo.modelo_entrenado is not None,
+        # estado_modelo: 'cargado' | 'entrenando' | 'ausente'. El servicio responde OK aunque el
+        # modelo esté ausente o entrenándose: /health indica si el proceso está vivo, no si ya
+        # puede predecir (para eso, mirar estado_modelo).
+        "estado_modelo": modelo.estado(),
+        "modelo_entrenado": modelo.modelo_entrenado,
+        "error_entrenamiento": modelo.error_entrenamiento,
         # modelo.metricas es {'Random Forest': {...}, 'XGBoost': {...}, 'Prophet': {...}}, no un
         # dict plano con 'precision' - hay que ir a las métricas del modelo GANADOR (nombre_modelo).
         "precision": float(modelo.metricas.get(modelo.nombre_modelo, {}).get('precision', 0)) if modelo.modelo_entrenado else None,
-        "fecha_entrenamiento": getattr(modelo, 'fecha_entrenamiento', None),
+        "fecha_entrenamiento": modelo.fecha_entrenamiento,
         "version": "1.0.0"
     }
 
 @app.get("/metrics")
 async def get_metrics():
     """Métricas del modelo para el backend Node.js"""
-    if modelo.modelo_entrenado is None:
+    if not modelo.modelo_entrenado:
         return {
             "entrenado": False,
+            "estado_modelo": modelo.estado(),
             "precision": 0.0,
             "total_predicciones": 0,
             "mensaje": "Modelo no entrenado aún"
@@ -167,7 +175,8 @@ async def get_metrics():
         "precision": float(modelo.metricas.get(modelo.nombre_modelo, {}).get('precision', 0)),
         "total_predicciones": int(total),
         "modelo_usado": str(modelo.nombre_modelo),
-        "fecha_entrenamiento": getattr(modelo, 'fecha_entrenamiento', datetime.now().isoformat()),
+        "estado_modelo": modelo.estado(),
+        "fecha_entrenamiento": modelo.fecha_entrenamiento,
         "metricas": modelo.metricas
     }
 
@@ -179,13 +188,18 @@ async def get_metricas():
 @app.get("/status")
 async def get_status():
     """Estado completo del servicio"""
-    entrenado = modelo.modelo_entrenado is not None
+    entrenado = modelo.modelo_entrenado
     return {
         "service": "ML Service OTS",
         "status": "online",
+        "estado_modelo": modelo.estado(),
         "modelo_entrenado": entrenado,
+        "entrenando": modelo.entrenando,
+        "error_entrenamiento": modelo.error_entrenamiento,
+        "modelo_usado": modelo.nombre_modelo if entrenado else None,
         "precision": float(modelo.metricas.get(modelo.nombre_modelo, {}).get('precision', 0)) if entrenado else 0,
-        "fecha_entrenamiento": getattr(modelo, 'fecha_entrenamiento', None),
+        "fecha_entrenamiento": modelo.fecha_entrenamiento,
+        "model_dir": MODEL_DIR,
         "version": "1.0.0",
         "timestamp": datetime.now().isoformat()
     }
@@ -526,30 +540,97 @@ async def generar_variables_estacionales_endpoint(request: VariablesEstacionales
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error generando variables estacionales: {str(e)}")
 
-@app.post("/entrenar")
-async def entrenar_modelo():
-    """Entrenar el modelo con datos de la base de datos"""
+# ==========================================
+# ENTRENAMIENTO (manual y automático al arrancar)
+# ==========================================
+MINIMO_REGISTROS_ENTRENAMIENTO = 30
+
+
+class EntrenamientoEnCurso(Exception):
+    """Ya hay otro entrenamiento corriendo (el automático o uno manual)."""
+
+
+class DatosInsuficientes(Exception):
+    """La BD no tiene datos suficientes para entrenar."""
+
+
+def entrenar_desde_bd():
+    """Carga el dataset de la BD y entrena. Un solo entrenamiento a la vez: si ya hay uno en
+    curso, lanza EntrenamientoEnCurso sin esperar. Lo usan POST /entrenar y el entrenamiento
+    automático del arranque."""
+    if not modelo.lock_entrenamiento.acquire(blocking=False):
+        raise EntrenamientoEnCurso()
+    modelo.entrenando = True
     try:
-        print("\n🔄 Iniciando entrenamiento comparativo (RF vs XGBoost)...")
+        print("\n🔄 Iniciando entrenamiento comparativo (RF vs XGBoost vs Prophet)...")
         df = obtener_dataset_ml()
 
         if df is None or len(df) == 0:
-            raise HTTPException(status_code=400, detail="No hay datos disponibles. Carga primero datos mediante el ETL.")
+            raise DatosInsuficientes("No hay datos disponibles. Carga primero datos mediante el ETL.")
 
-        if len(df) < 30:
-            raise HTTPException(status_code=400, detail=f"Se necesitan al menos 30 registros. Solo hay {len(df)}.")
+        if len(df) < MINIMO_REGISTROS_ENTRENAMIENTO:
+            raise DatosInsuficientes(
+                f"Se necesitan al menos {MINIMO_REGISTROS_ENTRENAMIENTO} registros. Solo hay {len(df)}.")
 
         if 'ocupacion_porcentaje' not in df.columns:
             if 'ocupacion' in df.columns:
                 df.rename(columns={'ocupacion': 'ocupacion_porcentaje'}, inplace=True)
             else:
-                raise HTTPException(status_code=400, detail="No se encontró la columna 'ocupacion_porcentaje'.")
+                raise DatosInsuficientes("No se encontró la columna 'ocupacion_porcentaje'.")
 
-        # Entrenar ambos modelos
         resultados = modelo.entrenar(df)
-        
-        # Guardar fecha de entrenamiento
-        modelo.fecha_entrenamiento = datetime.now().isoformat()
+        modelo.error_entrenamiento = None
+        return resultados
+    except Exception as e:
+        modelo.error_entrenamiento = str(e)
+        raise
+    finally:
+        modelo.entrenando = False
+        modelo.lock_entrenamiento.release()
+
+
+def _entrenamiento_automatico():
+    """Hilo de fondo del arranque: entrena si hay datos suficientes. Nunca tumba el servicio:
+    cualquier fallo (BD caída, pocos datos, error del modelo) queda solo como aviso en el log."""
+    try:
+        resultados = entrenar_desde_bd()
+        logger.info("Entrenamiento automático completado. Mejor modelo: %s (modelos en %s)",
+                    resultados['mejor_modelo'], MODEL_DIR)
+    except EntrenamientoEnCurso:
+        logger.info("Entrenamiento automático omitido: ya había otro entrenamiento en curso.")
+    except DatosInsuficientes as e:
+        logger.warning("Entrenamiento automático omitido: %s", e)
+    except Exception as e:
+        logger.warning("Entrenamiento automático falló (el servicio sigue funcionando; "
+                       "se puede entrenar a mano con POST /entrenar): %s", e)
+
+
+@app.on_event("startup")
+def inicializar_modelo():
+    """Al arrancar: si hay modelo en MODEL_DIR se carga; si no, se entrena en un hilo de fondo
+    para no bloquear el arranque ni /health (un entrenamiento puede tardar minutos)."""
+    try:
+        if modelo.cargar_modelo():
+            logger.info("Modelo cargado desde %s (%s, entrenado %s). No se reentrena.",
+                        MODEL_DIR, modelo.nombre_modelo, modelo.fecha_entrenamiento or "fecha desconocida")
+            return
+    except Exception as e:
+        # Un archivo dañado no debe impedir el arranque: se descarta lo cargado y se reentrena.
+        logger.warning("No se pudo cargar el modelo de %s (%s); se intentará reentrenar.", MODEL_DIR, e)
+        modelo.modelos, modelo.modelo_entrenado = {}, False
+
+    logger.info("No hay modelo en %s: se entrenará en segundo plano si la BD tiene al menos %d registros.",
+                MODEL_DIR, MINIMO_REGISTROS_ENTRENAMIENTO)
+    threading.Thread(target=_entrenamiento_automatico, name="entrenamiento-automatico", daemon=True).start()
+
+
+# Endpoint síncrono (def, no async def) a propósito: FastAPI lo ejecuta en un hilo aparte, así
+# un entrenamiento manual de varios minutos no congela el resto del servicio (/health incluido).
+@app.post("/entrenar")
+def entrenar_modelo():
+    """Entrenar el modelo con datos de la base de datos"""
+    try:
+        resultados = entrenar_desde_bd()
 
         print(f"\n✅ Modelo entrenado exitosamente!")
         print(f"   Mejor modelo: {resultados['mejor_modelo']}")
@@ -563,8 +644,10 @@ async def entrenar_modelo():
             "comparacion": resultados['comparacion'],
             "fecha_entrenamiento": modelo.fecha_entrenamiento
         }
-    except HTTPException:
-        raise
+    except EntrenamientoEnCurso:
+        raise HTTPException(status_code=409, detail="Ya hay un entrenamiento en curso. Espera a que termine (ver /status).")
+    except DatosInsuficientes as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         print(f"❌ ERROR: {str(e)}")
         import traceback
@@ -579,7 +662,7 @@ async def predecir_ocupacion(request: PrediccionRequest):
         print(f"📊 Datos recibidos: {request}")
         
         # Verificar modelo
-        if modelo.modelo_entrenado is None:
+        if not modelo.modelo_entrenado:
             print("⚠️ No hay modelo en memoria, intentando cargar...")
             if not modelo.cargar_modelo():
                 print("❌ ERROR: No se pudo cargar el modelo")

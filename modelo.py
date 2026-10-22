@@ -8,8 +8,27 @@ import pickle
 import os
 import re
 import json
+import threading
 from datetime import datetime
 from data_loader import obtener_dataset_ml
+
+# Carpeta donde se guardan y leen TODOS los archivos del modelo (.pkl de cada algoritmo y
+# modelo_ganador.json). En Dokploy debe ser un volumen persistente (ver Dockerfile): si no, cada
+# redeploy crea un contenedor nuevo, vacío, y el modelo entrenado se pierde. Una ruta relativa se
+# resuelve contra la carpeta de este proyecto (no contra el directorio desde donde se lanzó el
+# proceso), para que no dependa de dónde se ejecute uvicorn.
+_DIR_PROYECTO = os.path.dirname(os.path.abspath(__file__))
+MODEL_DIR = os.path.abspath(os.path.join(_DIR_PROYECTO, os.getenv('MODEL_DIR', './modelos')))
+
+
+def _guardar_atomico(ruta, escribir, modo='wb'):
+    """Escribe en un archivo temporal y lo renombra al final: si el proceso muere a mitad de
+    camino (p. ej. un redeploy durante un entrenamiento), nunca queda un .pkl a medio escribir
+    que rompería la carga del modelo en el siguiente arranque."""
+    temporal = ruta + '.tmp'
+    with open(temporal, modo, **({} if 'b' in modo else {'encoding': 'utf-8'})) as f:
+        escribir(f)
+    os.replace(temporal, ruta)
 
 try:
     import xgboost as xgb
@@ -43,9 +62,25 @@ class ModeloPredictor:
         self.metricas = {}  # Métricas comparativas
         self.nombre_modelo = "Random Forest"  # Modelo por defecto
         self.modelo_entrenado = False
-        self.archivo_modelo_rf = "modelo_rf_ots.pkl"
-        self.archivo_modelo_xgb = "modelo_xgb_ots.pkl"
-        self.archivo_modelo_prophet = "modelo_prophet_ots.pkl"
+        self.fecha_entrenamiento = None
+        os.makedirs(MODEL_DIR, exist_ok=True)
+        self.archivo_modelo_rf = os.path.join(MODEL_DIR, "modelo_rf_ots.pkl")
+        self.archivo_modelo_xgb = os.path.join(MODEL_DIR, "modelo_xgb_ots.pkl")
+        self.archivo_modelo_prophet = os.path.join(MODEL_DIR, "modelo_prophet_ots.pkl")
+        self.archivo_ganador = os.path.join(MODEL_DIR, "modelo_ganador.json")
+
+        # Un solo entrenamiento a la vez: el automático del arranque y el manual (POST /entrenar)
+        # comparten este lock. Quien no lo consigue no espera: se rechaza (ver app.py).
+        self.lock_entrenamiento = threading.Lock()
+        self.entrenando = False
+        self.error_entrenamiento = None  # último error del entrenamiento automático/manual
+
+    def estado(self):
+        """'entrenando' (hay un entrenamiento en curso, aunque ya exista un modelo anterior en
+        uso), 'cargado' (hay modelo listo para predecir) o 'ausente'."""
+        if self.entrenando:
+            return 'entrenando'
+        return 'cargado' if self.modelo_entrenado else 'ausente'
 
     def preprocesar(self, df):
         """Limpia y prepara los datos para el modelo"""
@@ -143,8 +178,7 @@ class ModeloPredictor:
         rf_metricas = self.calcular_metricas(y_test, rf_pred)
 
         # Guardar modelo RF
-        with open(self.archivo_modelo_rf, 'wb') as f:
-            pickle.dump(rf_model, f)
+        _guardar_atomico(self.archivo_modelo_rf, lambda f: pickle.dump(rf_model, f))
 
         resultados['Random Forest'] = rf_metricas
         print(f"    RMSE: {rf_metricas['rmse']}, Precisión: {rf_metricas['precision']}%")
@@ -166,8 +200,7 @@ class ModeloPredictor:
             xgb_metricas = self.calcular_metricas(y_test, xgb_pred)
 
             # Guardar modelo XGB
-            with open(self.archivo_modelo_xgb, 'wb') as f:
-                pickle.dump(xgb_model, f)
+            _guardar_atomico(self.archivo_modelo_xgb, lambda f: pickle.dump(xgb_model, f))
 
             resultados['XGBoost'] = xgb_metricas
             print(f"    RMSE: {xgb_metricas['rmse']}, Precisión: {xgb_metricas['precision']}%")
@@ -210,8 +243,8 @@ class ModeloPredictor:
                 prophet_pred = prophet_model.predict(df_prophet_test)['yhat'].values
                 prophet_metricas = self.calcular_metricas(y_test, prophet_pred)
 
-                with open(self.archivo_modelo_prophet, 'wb') as f:
-                    pickle.dump({'model': prophet_model, 'regresores': columnas_regresoras}, f)
+                _guardar_atomico(self.archivo_modelo_prophet, lambda f: pickle.dump(
+                    {'model': prophet_model, 'regresores': columnas_regresoras}, f))
 
                 resultados['Prophet'] = prophet_metricas
                 print(f"    RMSE: {prophet_metricas['rmse']}, Precisión: {prophet_metricas['precision']}%")
@@ -238,16 +271,16 @@ class ModeloPredictor:
         self.metricas = resultados
         self.nombre_modelo = mejor_modelo
         self.modelo_entrenado = True
+        self.fecha_entrenamiento = datetime.now().isoformat()
 
         # Se guarda cuál ganó para que, si el proceso se reinicia y solo se recarga el modelo
         # (cargar_modelo, sin volver a entrenar), se siga usando el ganador real y no el
         # "Random Forest" por defecto de la clase - antes se perdía este dato al reiniciar.
-        with open('modelo_ganador.json', 'w', encoding='utf-8') as f:
-            json.dump({
-                'nombre_modelo': mejor_modelo,
-                'fecha_entrenamiento': datetime.now().isoformat(),
-                'metricas': resultados
-            }, f)
+        _guardar_atomico(self.archivo_ganador, lambda f: json.dump({
+            'nombre_modelo': mejor_modelo,
+            'fecha_entrenamiento': self.fecha_entrenamiento,
+            'metricas': resultados
+        }, f), modo='w')
 
         return {
             'mejor_modelo': mejor_modelo,
@@ -340,8 +373,8 @@ class ModeloPredictor:
             with open(self.archivo_modelo_prophet, 'rb') as f:
                 self.modelos['Prophet'] = pickle.load(f)
 
-        if os.path.exists('modelo_ganador.json'):
-            with open('modelo_ganador.json', 'r', encoding='utf-8') as f:
+        if os.path.exists(self.archivo_ganador):
+            with open(self.archivo_ganador, 'r', encoding='utf-8') as f:
                 info = json.load(f)
             if info.get('nombre_modelo') in self.modelos and self.modelos[info['nombre_modelo']] is not None:
                 self.nombre_modelo = info['nombre_modelo']

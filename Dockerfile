@@ -25,5 +25,16 @@ RUN python -m cmdstanpy.install_cmdstan --verbose
 
 COPY . .
 
+# ── Modelos de ML: /app/modelos DEBE montarse como volumen persistente ──────────────────────
+# Ahí se guardan los modelos entrenados (.pkl + modelo_ganador.json). Cada redeploy crea un
+# contenedor nuevo desde esta imagen, que NO trae modelos (.dockerignore los excluye), así que
+# sin volumen el modelo se pierde y el servicio reentrena al arrancar (minutos, y solo si la BD
+# tiene al menos 30 registros). En Dokploy: Advanced -> Volumes/Mounts -> Volume Mount con
+# mount path /app/modelos.
+# No se usa la instrucción VOLUME a propósito: crearía un volumen ANÓNIMO distinto en cada
+# contenedor, que tampoco sobrevive a un redeploy - hace falta un volumen con nombre.
+ENV MODEL_DIR=/app/modelos
+RUN mkdir -p /app/modelos
+
 EXPOSE 5000
 CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "5000"]

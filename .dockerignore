@@ -6,3 +6,4 @@ __pycache__
 *.pkl
 modelo_ganador.json
 *.log
+modelos
