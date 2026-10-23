@@ -714,7 +714,15 @@ async def predecir_ocupacion(request: PrediccionRequest):
         
         print(f"✅ Predicción generada: {prediccion_float}%")
 
-        # Guardar en BD
+        # Guardar en BD.
+        # ⚠ PENDIENTE DE DECISIÓN: este INSERT falla siempre (la columna es `fecha`, no
+        # `fecha_objetivo`; modelo_utilizado recibe 'Random Forest' y el ENUM es 'RandomForest') y
+        # además usa id_hotel=1 fijo, aunque el modelo predice la ocupación del DESTINO, no la de un
+        # hotel (entrena sin id_hotel y /predecir no recibe hotel). Corregir solo las columnas
+        # guardaría predicciones falsas del hotel 1. Hasta decidir si se quita o se rediseña
+        # (id_hotel nullable para predicciones de destino), el fallo se registra en el log en vez de
+        # quedar oculto, y la predicción se devuelve igual.
+        conn = None
         try:
             conn = get_db_connection()
             with conn.cursor() as cursor:
@@ -733,11 +741,16 @@ async def predecir_ocupacion(request: PrediccionRequest):
                     'pendiente'
                 ))
             conn.commit()
-            conn.close()
-            print("✅ Predicción guardada en BD")
+            logger.info("Predicción guardada en la tabla predicciones")
         except Exception as db_err:
-            print(f"⚠️ Advertencia al guardar en BD: {str(db_err)}")
-        
+            if conn is not None:
+                conn.rollback()
+            logger.warning("No se pudo guardar la predicción en la tabla predicciones "
+                           "(la respuesta al usuario no se ve afectada): %s", db_err)
+        finally:
+            if conn is not None:
+                conn.close()
+
         return {
             "success": True,
             "fecha_objetivo": request.fecha_objetivo,

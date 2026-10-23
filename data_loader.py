@@ -5,6 +5,7 @@ from variables_estacionales import generar_variables_estacionales
 
 def obtener_dataset_ml():
     """Obtiene el dataset completo para entrenar el modelo ML"""
+    connection = None
     try:
         connection = pymysql.connect(**DB_PARAMS)
 
@@ -19,6 +20,14 @@ def obtener_dataset_ml():
             rango = cursor.fetchone()
         if rango and rango[0] and rango[1]:
             generar_variables_estacionales(rango[0], rango[1])
+
+        # generar_variables_estacionales inserta y hace commit por OTRA conexión. Esta conexión
+        # (sin autocommit, REPEATABLE READ) quedó con la "foto" de la BD tomada en el SELECT de
+        # arriba y no vería esas filas nuevas: el JOIN de abajo devolvía mes/dia_semana en NULL
+        # para fechas recién cargadas y el primer entrenamiento fallaba (XGBoost rechaza columnas
+        # object). Cerrar la transacción de lectura aquí hace que la consulta siguiente abra una
+        # foto nueva. Es solo lectura: este commit no escribe nada.
+        connection.commit()
 
         query = """
             SELECT
@@ -53,7 +62,6 @@ def obtener_dataset_ml():
         """
 
         df = pd.read_sql(query, connection)
-        connection.close()
 
         print(f"Dataset cargado: {len(df)} registros")
         return df
@@ -61,3 +69,6 @@ def obtener_dataset_ml():
     except Exception as e:
         print(f"Error al cargar datos: {e}")
         raise
+    finally:
+        if connection is not None:
+            connection.close()
