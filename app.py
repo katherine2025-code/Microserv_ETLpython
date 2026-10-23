@@ -714,42 +714,10 @@ async def predecir_ocupacion(request: PrediccionRequest):
         
         print(f"✅ Predicción generada: {prediccion_float}%")
 
-        # Guardar en BD.
-        # ⚠ PENDIENTE DE DECISIÓN: este INSERT falla siempre (la columna es `fecha`, no
-        # `fecha_objetivo`; modelo_utilizado recibe 'Random Forest' y el ENUM es 'RandomForest') y
-        # además usa id_hotel=1 fijo, aunque el modelo predice la ocupación del DESTINO, no la de un
-        # hotel (entrena sin id_hotel y /predecir no recibe hotel). Corregir solo las columnas
-        # guardaría predicciones falsas del hotel 1. Hasta decidir si se quita o se rediseña
-        # (id_hotel nullable para predicciones de destino), el fallo se registra en el log en vez de
-        # quedar oculto, y la predicción se devuelve igual.
-        conn = None
-        try:
-            conn = get_db_connection()
-            with conn.cursor() as cursor:
-                sql_insert = """
-                    INSERT INTO predicciones 
-                    (id_hotel, fecha_objetivo, fecha_generacion, ocupacion_predicha, 
-                     precision_modelo, modelo_utilizado, estado)
-                    VALUES (%s, %s, NOW(), %s, %s, %s, %s)
-                """
-                cursor.execute(sql_insert, (
-                    1,
-                    request.fecha_objetivo,
-                    round(prediccion_float, 2),
-                    round(precision_modelo, 2),
-                    str(modelo.nombre_modelo),
-                    'pendiente'
-                ))
-            conn.commit()
-            logger.info("Predicción guardada en la tabla predicciones")
-        except Exception as db_err:
-            if conn is not None:
-                conn.rollback()
-            logger.warning("No se pudo guardar la predicción en la tabla predicciones "
-                           "(la respuesta al usuario no se ve afectada): %s", db_err)
-        finally:
-            if conn is not None:
-                conn.close()
+        # La predicción NO se guarda en la tabla predicciones: el modelo predice la ocupación del
+        # destino (entrena sin id_hotel y /predecir no recibe hotel), y esa tabla es por hotel.
+        # El simulador es una consulta "qué pasaría si"; antes se intentaba guardar como hotel 1
+        # (un registro inventado) y además fallaba siempre.
 
         return {
             "success": True,
