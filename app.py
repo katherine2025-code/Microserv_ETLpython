@@ -11,6 +11,7 @@ import pymysql
 import os
 from dotenv import load_dotenv
 import logging
+import traceback
 import threading
 
 from db_config import DB_CONFIG
@@ -300,10 +301,8 @@ async def procesar_csv(file: UploadFile = File(...), tipo: str = Form(None)):
     except HTTPException:
         raise
     except Exception as e:
-        print(f"❌ Error general procesando archivo: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Error procesando archivo: {str(e)}")
+        logger.exception("Error procesando archivo %s", file.filename)
+        raise HTTPException(status_code=500, detail="Error procesando archivo")
 
 # ==========================================
 # FUNCIONES ETL (mantenidas igual)
@@ -637,10 +636,8 @@ def entrenar_modelo():
     except DatosInsuficientes as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        print(f"❌ ERROR: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+        logger.exception("Error en entrenamiento")
+        raise HTTPException(status_code=500, detail="Error al iniciar entrenamiento")
 
 @app.post("/predecir")
 async def predecir_ocupacion(request: PrediccionRequest):
@@ -723,10 +720,8 @@ async def predecir_ocupacion(request: PrediccionRequest):
     except HTTPException:
         raise
     except Exception as e:
-        print(f"❌ ERROR CRÍTICO EN PREDICCIÓN: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Error al generar predicción: {str(e)}")
+        logger.exception("Error en predicción")
+        raise HTTPException(status_code=500, detail="Error al generar predicción")
 
 @app.post("/predecir-rango")
 async def predecir_ocupacion_rango(request: PrediccionRangoRequest):
@@ -868,10 +863,8 @@ async def predecir_ocupacion_rango(request: PrediccionRangoRequest):
     except HTTPException:
         raise
     except Exception as e:
-        print(f"❌ ERROR en predicción por rango: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Error en proyección: {str(e)}")
+        logger.exception("Error en predicción por rango")
+        raise HTTPException(status_code=500, detail="Error en proyección")
 
 @app.get("/predicciones-historicas")
 async def predicciones_historicas(limite: Optional[int] = None, dias: Optional[int] = None):
@@ -939,10 +932,8 @@ async def predicciones_historicas(limite: Optional[int] = None, dias: Optional[i
     except HTTPException:
         raise
     except Exception as e:
-        print(f"❌ ERROR en validación histórica: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Error en validación histórica: {str(e)}")
+        logger.exception("Error en validación histórica")
+        raise HTTPException(status_code=500, detail="Error en validación histórica")
 
 if __name__ == "__main__":
     print("\n" + "="*60)
