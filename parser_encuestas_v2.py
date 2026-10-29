@@ -16,7 +16,7 @@ import re
 
 import pandas as pd
 
-from etl_utils import _reparar_mojibake
+from etl_utils import _reparar_mojibake, _norm, TOKENS_NULOS
 from cantones import columnas_de
 from kobo_encuestas_turismo import (
     EDAD_MAPEO, PAIS_MAPEO, NOCHES_MAPEO, NIVEL_EDUCATIVO_MAPEO, OCUPACION_MAPEO,
@@ -26,7 +26,6 @@ from kobo_encuestas_turismo import (
 )
 
 NO_RESPONDER = 'Prefiero no responder'
-TOKENS_NULOS = {'', 'nan', 'null', 'none', 'n/a', 'na', '-'}
 
 # Firma del formato: nombres de variable que solo existen en este export.
 _COLUMNAS_FIRMA = ('edad', 'sexo', 'pais_origen', 'perfil_viajero', 'nps_volver')
@@ -39,10 +38,6 @@ _MAPEO_POR_CAMPO = {q['campo']: (q['mapeo'], q.get('tipo', 'texto')) for q in PR
 def es_encuesta_v2(columnas) -> bool:
     nombres = {str(c).strip().lower() for c in columnas}
     return all(c in nombres for c in _COLUMNAS_FIRMA)
-
-
-def _norm(v):
-    return re.sub(r'\s+', ' ', str(v)).strip()
 
 
 def _valido(v):

@@ -26,6 +26,7 @@ from datetime import timedelta
 
 import pandas as pd
 
+from etl_utils import _norm, TOKENS_NULOS
 from cantones import canton_de_parroquia, normalizar_canton, columnas_de
 from kobo_encuestas_turismo import (
     EDAD_MAPEO, PAIS_MAPEO, NOCHES_MAPEO, GASTO_MAPEO,
@@ -36,7 +37,6 @@ from kobo_encuestas_turismo import (
 
 COLUMNAS_MARCADOR = ('tipo_encuesta', 'fecha_encuesta')
 NO_RESPONDER = 'Prefiero no responder'
-TOKENS_NULOS = {'', 'nan', 'null', 'none', 'n/a', 'na', '-'}
 SEPARADOR_MULTIPLE = ' | '
 ECUADOR_UTC = timedelta(hours=-5)  # Ecuador continental: sin horario de verano
 
@@ -95,10 +95,6 @@ def tipo_encuesta_del_archivo(df):
 # ==========================================================================
 # UTILIDADES
 # ==========================================================================
-def _norm(texto) -> str:
-    return re.sub(r'\s+', ' ', str(texto)).strip()
-
-
 def _valido(valor) -> bool:
     if valor is None or (isinstance(valor, float) and pd.isna(valor)):
         return False

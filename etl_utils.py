@@ -135,6 +135,13 @@ def leer_archivo(filename: str, contents: bytes) -> pd.DataFrame:
 # ==========================================================================
 # NORMALIZACIÓN DE TEXTO
 # ==========================================================================
+def _norm(texto: str) -> str:
+    """Colapsa espacios múltiples y recorta extremos. Base compartida por todos
+    los parsers: kobo_*.py, ots_app_encuestas.py y parser_encuestas_v2.py la
+    importan de aquí en vez de redefinirla localmente."""
+    return re.sub(r'\s+', ' ', str(texto)).strip()
+
+
 def _reparar_mojibake(texto: str) -> str:
     """Corrige texto mal decodificado por un mismatch de encoding
     (p.ej. 'CafÃ©' -> 'Café'), típico de exportaciones CSV desde Windows."""
