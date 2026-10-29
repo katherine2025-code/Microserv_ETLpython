@@ -97,10 +97,9 @@ modelo = ModeloPredictor()
 # ==========================================
 # Ver db_config.py (única fuente de la configuración de BD)
 
-print(f"\n📊 Configuración de BD en Python:")
-print(f"   Host: {DB_CONFIG['host']}")
-print(f"   Usuario: {DB_CONFIG['user']}")
-print(f"   Base de datos: {DB_CONFIG['database']}\n")
+MAX_UPLOAD_BYTES = 50 * 1024 * 1024  # 50 MB
+
+logger.info("BD configurada en %s, base %s", DB_CONFIG['host'], DB_CONFIG['database'])
 
 def get_db_connection():
     """Crear conexión a MySQL"""
@@ -108,8 +107,8 @@ def get_db_connection():
         connection = pymysql.connect(**DB_CONFIG)
         return connection
     except Exception as e:
-        print(f"❌ ERROR DE CONEXIÓN A BD: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error de conexión BD: {str(e)}")
+        logger.error("Error de conexión a BD: %s", e)
+        raise HTTPException(status_code=503, detail="Base de datos no disponible")
 
 # ==========================================
 # NUEVOS ENDPOINTS PARA COMPATIBILIDAD CON BACKEND NODE.JS
@@ -205,8 +204,10 @@ async def procesar_csv(file: UploadFile = File(...), tipo: str = Form(None)):
         )
 
     try:
-        contents = await file.read()
-        print(f"\n📄 Archivo recibido: {file.filename} ({len(contents)} bytes) - tipo: {tipo}")
+        contents = await file.read(MAX_UPLOAD_BYTES + 1)
+        if len(contents) > MAX_UPLOAD_BYTES:
+            raise HTTPException(status_code=413, detail=f"Archivo demasiado grande (límite: {MAX_UPLOAD_BYTES // (1024*1024)} MB)")
+        logger.info("Archivo recibido: %s (%d bytes) tipo=%s", file.filename, len(contents), tipo)
 
         try:
             df_crudo = leer_archivo(file.filename, contents)
