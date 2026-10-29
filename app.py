@@ -160,20 +160,9 @@ async def get_metrics():
             "mensaje": "Modelo no entrenado aún"
         }
     
-    # Obtener total de predicciones de la BD
-    try:
-        conn = get_db_connection()
-        with conn.cursor() as cursor:
-            cursor.execute("SELECT COUNT(*) as total FROM predicciones")
-            total = cursor.fetchone()['total']
-        conn.close()
-    except:
-        total = 0
-    
     return {
         "entrenado": True,
         "precision": float(modelo.metricas.get(modelo.nombre_modelo, {}).get('precision', 0)),
-        "total_predicciones": int(total),
         "modelo_usado": str(modelo.nombre_modelo),
         "estado_modelo": modelo.estado(),
         "fecha_entrenamiento": modelo.fecha_entrenamiento,
@@ -763,23 +752,25 @@ async def predecir_ocupacion_rango(request: PrediccionRangoRequest):
             raise HTTPException(status_code=400, detail="El rango máximo permitido es de 1 año (370 días).")
             
         connection = get_db_connection()
-        cursor = connection.cursor()
-        
-        # Consultar clima
-        query_clima = "SELECT fecha, temperatura, humedad, precipitacion FROM clima WHERE fecha BETWEEN %s AND %s"
-        cursor.execute(query_clima, (request.fecha_inicio, request.fecha_fin))
-        clima_dict = {}
-        for row in cursor.fetchall():
-            fecha_str = row['fecha'].strftime('%Y-%m-%d') if row['fecha'] else None
-            if fecha_str:
-                clima_dict[fecha_str] = row
-        
-        # Consultar feriados
-        query_feriados = "SELECT fecha_inicio, fecha_fin, temporada, total_dias FROM feriados WHERE fecha_inicio <= %s AND fecha_fin >= %s"
-        cursor.execute(query_feriados, (request.fecha_fin, request.fecha_inicio))
-        feriados_list = cursor.fetchall()
-        cursor.close()
-        connection.close()
+        try:
+            cursor = connection.cursor()
+
+            # Consultar clima
+            query_clima = "SELECT fecha, temperatura, humedad, precipitacion FROM clima WHERE fecha BETWEEN %s AND %s"
+            cursor.execute(query_clima, (request.fecha_inicio, request.fecha_fin))
+            clima_dict = {}
+            for row in cursor.fetchall():
+                fecha_str = row['fecha'].strftime('%Y-%m-%d') if row['fecha'] else None
+                if fecha_str:
+                    clima_dict[fecha_str] = row
+
+            # Consultar feriados
+            query_feriados = "SELECT fecha_inicio, fecha_fin, temporada, total_dias FROM feriados WHERE fecha_inicio <= %s AND fecha_fin >= %s"
+            cursor.execute(query_feriados, (request.fecha_fin, request.fecha_inicio))
+            feriados_list = cursor.fetchall()
+            cursor.close()
+        finally:
+            connection.close()
         
         predicciones_diarias = []
         fechas_rango = pd.date_range(start_date, end_date)

@@ -32,7 +32,7 @@ import json
 import re
 import pandas as pd
 
-from etl_utils import _reparar_mojibake
+from etl_utils import _reparar_mojibake, _norm, TOKENS_NULOS
 from cantones import columnas_de
 
 MARCADOR_FORMULARIO = 'nivel de satisfaccion'
@@ -53,8 +53,6 @@ PROBABILIDAD_RETORNO_NOTA = (
     "formulario en KoboToolbox - ver docstring de kobo_encuestas_turismo.py."
 )
 
-TOKENS_NULOS = {'', 'nan', 'null', 'none', 'n/a', 'na', '-'}
-
 # Prefijos/sub-strings de columnas que NO son respuestas de opción (metadatos
 # de Kobo, GPS, texto libre que podría dar falsos positivos por substring).
 _EXCLUIR_PREFIJOS = ('_', 'meta/', 'start', 'end', 'Unnamed', 'Ubicacion')
@@ -65,10 +63,6 @@ def es_formulario_turismo(columnas) -> bool:
     """Detecta este formulario por el texto literal de la pregunta de
     satisfacción general, presente en todas las exportaciones vistas."""
     return any(MARCADOR_FORMULARIO in _norm(c).lower() for c in columnas)
-
-
-def _norm(texto) -> str:
-    return re.sub(r'\s+', ' ', str(texto)).strip()
 
 
 def _valor_valido(valor) -> bool:

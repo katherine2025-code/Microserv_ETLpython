@@ -39,7 +39,7 @@ los revise/complete después desde el panel.
 import re
 import pandas as pd
 
-from etl_utils import _reparar_mojibake
+from etl_utils import _reparar_mojibake, _norm
 from cantones import canton_de_parroquia, columnas_de
 
 MARCADOR_FORMULARIO = 'display:none'
@@ -57,10 +57,6 @@ def es_formulario_establecimientos(columnas) -> bool:
     """Detecta este formulario por la presencia de las columnas ocultas que
     Kobo genera al aplanar el grupo repetido de fechas de ocupación."""
     return any(MARCADOR_FORMULARIO in str(c) for c in columnas)
-
-
-def _norm(texto) -> str:
-    return re.sub(r'\s+', ' ', str(texto)).strip()
 
 
 def _norm_nombre(texto) -> str:
