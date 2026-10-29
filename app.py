@@ -156,7 +156,6 @@ async def get_metrics():
             "entrenado": False,
             "estado_modelo": modelo.estado(),
             "precision": 0.0,
-            "total_predicciones": 0,
             "mensaje": "Modelo no entrenado aún"
         }
     
@@ -492,7 +491,6 @@ class PrediccionRequest(BaseModel):
 class PrediccionRangoRequest(BaseModel):
     fecha_inicio: str
     fecha_fin: str
-    id_hotel: Optional[int] = 1
 
 class VariablesEstacionalesRequest(BaseModel):
     fecha_inicio: Optional[str] = None

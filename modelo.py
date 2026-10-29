@@ -308,6 +308,7 @@ class ModeloPredictor:
 
     def predecir(self, datos_input):
         """Genera predicción usando el mejor modelo, manejando columnas faltantes"""
+        datos_input = dict(datos_input)  # no mutar el dict del llamador
         if not self.modelo_entrenado:
             self.cargar_modelo()
 
