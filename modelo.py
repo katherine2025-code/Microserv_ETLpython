@@ -36,6 +36,17 @@ COLUMNAS_FUGA = [
     'habitaciones_ocupadas', 'habitaciones_disponibles', 'tarifa_cobrada',
 ]
 
+# ==========================================================================================
+# CLIMA: por ahora NO se usa como predictor (aunque la tabla `clima` tenga datos reales)
+# ==========================================================================================
+# El clima es constante por fecha (todos los hoteles de un día comparten el mismo clima), así que
+# solo aporta ~19 valores distintos. Con tan pocas fechas, agregar temperatura/humedad/precipitación/
+# viento NO mejora la generalización y de hecho la empeora: validando dejando fechas completas fuera,
+# el R² honesto baja de ~0.24 (solo calendario) a ~0.07 (sobreajuste). Por eso el clima se REGISTRA
+# con datos reales (para credibilidad y para el futuro) pero se excluye de las variables del modelo.
+# Cuando el histórico tenga muchas más fechas, se puede reactivar quitando esta lista de la exclusión.
+COLUMNAS_CLIMA_EXCLUIDAS = ['temperatura', 'humedad', 'precipitacion', 'velocidad_viento']
+
 
 def _guardar_atomico(ruta, escribir, modo='wb'):
     """Escribe en un archivo temporal y lo renombra al final: si el proceso muere a mitad de
@@ -130,7 +141,7 @@ class ModeloPredictor:
         #    Como preprocesar() se usa igual al entrenar y al predecir, excluirlas aquí garantiza
         #    que el modelo nunca las vea en ninguno de los dos caminos.
         columnas_a_eliminar = ['id_hotel', 'fecha_registro', 'cedula_encuestador', 'id',
-                               'id_feriado', 'id_clima', 'id_ocupacion'] + COLUMNAS_FUGA
+                               'id_feriado', 'id_clima', 'id_ocupacion'] + COLUMNAS_FUGA + COLUMNAS_CLIMA_EXCLUIDAS
         data.drop(columns=[c for c in columnas_a_eliminar if c in data.columns], inplace=True, errors='ignore')
 
         # 4. Rellenar nulos con 0
