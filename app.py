@@ -660,18 +660,11 @@ async def predecir_ocupacion(request: PrediccionRequest):
         fecha_obj = datetime.strptime(request.fecha_objetivo, '%Y-%m-%d').date()
         ve = obtener_o_generar(fecha_obj)
 
-        # Si el usuario no envía check-in/tarifa (el simulador simplificado solo pide fecha y
-        # temporada), se usan valores típicos SEGÚN LA TEMPORADA - los mismos que /predecir-rango -
-        # para que la temporada elegida realmente influya en la predicción.
-        temporada = request.temporada or "Media"
-        _alta = temporada == "Alta"
-
-        # Preparar datos
+        # El modelo ya NO usa check-in / tarifa (son fuga de datos: se derivan de la ocupación del
+        # día y no se conocen para una fecha futura). La predicción depende solo de la fecha
+        # (calendario), la temporada y el clima, así que aquí ya no se inventan esos valores.
         datos = {
             'fecha': request.fecha_objetivo,
-            'checkin_nacionales': request.checkin_nacionales or (60 if _alta else 35),
-            'checkin_extranjeros': request.checkin_extranjeros or (20 if _alta else 8),
-            'tarifa_cobrada': request.tarifa_cobrada or (90.0 if _alta else 70.0),
             'temperatura': request.temperatura or 26,
             'humedad': request.humedad or 70,
             'precipitacion': request.precipitacion or 0,
@@ -793,11 +786,9 @@ async def predecir_ocupacion_rango(request: PrediccionRangoRequest):
                 
             ve = obtener_o_generar(fecha_dt.date())
 
+            # Sin check-in/tarifa inventados: el modelo ya no los usa (fuga de datos).
             datos_dia = {
                 'fecha': fecha_str,
-                'checkin_nacionales': 60 if temporada == "Alta" else 35,
-                'checkin_extranjeros': 20 if temporada == "Alta" else 8,
-                'tarifa_cobrada': 90.0 if temporada == "Alta" else 70.0,
                 'temperatura': temp,
                 'humedad': hum,
                 'precipitacion': prec,

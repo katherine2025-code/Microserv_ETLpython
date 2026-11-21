@@ -1,7 +1,7 @@
 import pandas as pd
 import numpy as np
 from sklearn.ensemble import RandomForestRegressor
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, GroupKFold, cross_val_predict
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 from sklearn.preprocessing import LabelEncoder
 import pickle
@@ -19,6 +19,33 @@ from data_loader import obtener_dataset_ml
 # proceso), para que no dependa de dónde se ejecute uvicorn.
 _DIR_PROYECTO = os.path.dirname(os.path.abspath(__file__))
 MODEL_DIR = os.path.abspath(os.path.join(_DIR_PROYECTO, os.getenv('MODEL_DIR', './modelos')))
+
+# ==========================================================================================
+# VARIABLES QUE EL MODELO NO DEBE USAR COMO PREDICTORAS (FUGA DE DATOS / "DATA LEAKAGE")
+# ==========================================================================================
+# La ocupación se calcula como habitaciones_ocupadas / habitaciones_disponibles * 100. Por eso
+# habitaciones_ocupadas, pernoctaciones y los check-in SON prácticamente la misma información que
+# la respuesta: dárselas al modelo es como pedirle que adivine la edad de alguien entregándole su
+# fecha de nacimiento. Además, para predecir un feriado FUTURO no se conocen (¿cuántos check-in
+# habrá?), así que al predecir habría que inventarlas y la predicción saldría casi igual siempre.
+# Se excluyen para que el modelo aprenda de verdad el patrón por fecha/temporada. La tarifa_cobrada
+# también es un valor observado ese día (no se conoce de antemano) y su correlación con la
+# ocupación era ~0, así que tampoco se usa.
+COLUMNAS_FUGA = [
+    'checkin_nacionales', 'checkin_extranjeros', 'pernoctaciones',
+    'habitaciones_ocupadas', 'habitaciones_disponibles', 'tarifa_cobrada',
+]
+
+# ==========================================================================================
+# CLIMA: por ahora NO se usa como predictor (aunque la tabla `clima` tenga datos reales)
+# ==========================================================================================
+# El clima es constante por fecha (todos los hoteles de un día comparten el mismo clima), así que
+# solo aporta ~19 valores distintos. Con tan pocas fechas, agregar temperatura/humedad/precipitación/
+# viento NO mejora la generalización y de hecho la empeora: validando dejando fechas completas fuera,
+# el R² honesto baja de ~0.24 (solo calendario) a ~0.07 (sobreajuste). Por eso el clima se REGISTRA
+# con datos reales (para credibilidad y para el futuro) pero se excluye de las variables del modelo.
+# Cuando el histórico tenga muchas más fechas, se puede reactivar quitando esta lista de la exclusión.
+COLUMNAS_CLIMA_EXCLUIDAS = ['temperatura', 'humedad', 'precipitacion', 'velocidad_viento']
 
 
 def _guardar_atomico(ruta, escribir, modo='wb'):
@@ -110,8 +137,11 @@ class ModeloPredictor:
             data['temporada_cod'] = le.fit_transform(data['temporada'].fillna('Media').astype(str))
             data.drop(columns=['temporada'], inplace=True)
 
-        # 3. Eliminar columnas no útiles
-        columnas_a_eliminar = ['id_hotel', 'fecha_registro', 'cedula_encuestador', 'id', 'id_feriado', 'id_clima', 'id_ocupacion']
+        # 3. Eliminar columnas no útiles + las de FUGA DE DATOS (ver COLUMNAS_FUGA arriba).
+        #    Como preprocesar() se usa igual al entrenar y al predecir, excluirlas aquí garantiza
+        #    que el modelo nunca las vea en ninguno de los dos caminos.
+        columnas_a_eliminar = ['id_hotel', 'fecha_registro', 'cedula_encuestador', 'id',
+                               'id_feriado', 'id_clima', 'id_ocupacion'] + COLUMNAS_FUGA + COLUMNAS_CLIMA_EXCLUIDAS
         data.drop(columns=[c for c in columnas_a_eliminar if c in data.columns], inplace=True, errors='ignore')
 
         # 4. Rellenar nulos con 0
@@ -145,8 +175,94 @@ class ModeloPredictor:
             'precision': round(float(precision), 2)
         }
 
+    def _metricas_dobles(self, crear_estimador, X, y, X_train, y_train, X_test, y_test, fechas, gkf):
+        """Calcula las métricas de un modelo sklearn con DOS lecturas, ambas se reportan en la tesis:
+
+        - 'precision'/'rmse'/'mae'/'r2' = validación HONESTA dejando FECHAS completas fuera
+          (GroupKFold por fecha): mide qué tan bien predice una fecha que el modelo NUNCA vio. Es la
+          cifra metodológicamente correcta (la que se defiende ante la tutora).
+        - '*_conocido' = split aleatorio 70/30: mide qué tan bien predice hoteles de un feriado que
+          SÍ observó (el caso de uso real: feriados que se repiten año a año). Siempre sale más alta.
+
+        El modelo final que se guarda para predecir se entrena aparte con TODOS los datos."""
+        est = crear_estimador()
+        est.fit(X_train, y_train)
+        m_conocido = self.calcular_metricas(y_test, est.predict(X_test))
+
+        if gkf is not None:
+            # Predicción "fuera de muestra" por validación cruzada agrupada por fecha.
+            y_cv = cross_val_predict(crear_estimador(), X, y, groups=fechas, cv=gkf)
+            m_honesto = self.calcular_metricas(y, y_cv)
+        else:
+            m_honesto = m_conocido  # muy pocas fechas: no se puede dejar fechas fuera
+
+        return {
+            **m_honesto,
+            'precision_conocido': m_conocido['precision'],
+            'rmse_conocido': m_conocido['rmse'],
+            'mae_conocido': m_conocido['mae'],
+            'r2_conocido': m_conocido['r2'],
+        }
+
+    def _ajustar_prophet(self, df, idx, X, y, regresores):
+        """Ajusta un Prophet usando la fecha real como 'ds' y los regresores indicados. idx son las
+        etiquetas de índice (filas) a usar."""
+        df_tr = pd.DataFrame({
+            'ds': pd.to_datetime(df.loc[idx, 'fecha']).values,
+            'y': y.loc[idx].values,
+        })
+        for c in regresores:
+            df_tr[c] = X.loc[idx, c].values
+        m = Prophet()
+        for c in regresores:
+            m.add_regressor(c)
+        m.fit(df_tr)
+        return m
+
+    def _predecir_prophet(self, modelo_p, df, idx, X, regresores):
+        df_te = pd.DataFrame({'ds': pd.to_datetime(df.loc[idx, 'fecha']).values})
+        for c in regresores:
+            df_te[c] = X.loc[idx, c].values
+        return modelo_p.predict(df_te)['yhat'].values
+
+    def _metricas_prophet(self, df, X, y, regresores, fechas, gkf):
+        """Mismas dos lecturas (honesta + conocido) que _metricas_dobles, pero para Prophet, que
+        necesita la fecha real ('ds') en vez de mes/dia_semana derivados."""
+        etiquetas = X.index
+        pos = np.arange(len(y))
+        tr, te = train_test_split(pos, test_size=0.3, random_state=42)
+        m = self._ajustar_prophet(df, etiquetas[tr], X, y, regresores)
+        yhat_te = self._predecir_prophet(m, df, etiquetas[te], X, regresores)
+        m_conocido = self.calcular_metricas(y.iloc[te].values, yhat_te)
+
+        if gkf is not None:
+            y_cv = np.empty(len(y)); y_cv[:] = np.nan
+            for tr2, te2 in gkf.split(X, y, fechas):
+                mm = self._ajustar_prophet(df, etiquetas[tr2], X, y, regresores)
+                y_cv[te2] = self._predecir_prophet(mm, df, etiquetas[te2], X, regresores)
+            m_honesto = self.calcular_metricas(y.values, y_cv)
+        else:
+            m_honesto = m_conocido
+
+        return {
+            **m_honesto,
+            'precision_conocido': m_conocido['precision'],
+            'rmse_conocido': m_conocido['rmse'],
+            'mae_conocido': m_conocido['mae'],
+            'r2_conocido': m_conocido['r2'],
+        }
+
     def entrenar(self, df):
-        """Entrena AMBOS algoritmos y los compara"""
+        """Entrena los 3 algoritmos (Random Forest, XGBoost, Prophet) y los compara.
+
+        CORRECCIÓN (nov-2026): el modelo ya NO usa check-in / pernoctaciones / habitaciones
+        ocupadas / tarifa como predictoras (ver COLUMNAS_FUGA): esas variables SON la ocupación del
+        día y no se conocen para una fecha futura, así que entrenaban al modelo a "copiar" la
+        respuesta (fuga de datos) e inflaban las métricas. Ahora predice SOLO con variables que sí
+        se conocen de antemano: calendario (mes, día de semana, feriado, semana del año), temporada
+        y clima. Además la métrica principal se valida dejando FECHAS completas fuera (GroupKFold),
+        para medir la generalización real a una fecha nueva y no la memorización de las ya vistas.
+        El modelo final se entrena con TODOS los datos."""
         data = self.preprocesar(df)
 
         if data is None or len(data) < 10:
@@ -163,8 +279,18 @@ class ModeloPredictor:
         X = data.drop(columns=[target])
         y = data[target]
 
-        # División 70/30
+        # Fecha de cada fila: es el "grupo" para la validación honesta (una misma fecha no puede
+        # estar a la vez en entrenamiento y en prueba; si no, el modelo "ya vio" el día que se le
+        # pregunta y la métrica sale inflada).
+        fechas = pd.to_datetime(df.loc[data.index, 'fecha']) if 'fecha' in df.columns else None
+        n_fechas = int(fechas.nunique()) if fechas is not None else 0
+
+        # Split aleatorio 70/30 -> métrica "por feriado conocido".
         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3, random_state=42)
+        # Validación dejando fechas fuera -> métrica honesta. Requiere >=3 fechas distintas.
+        gkf = GroupKFold(n_splits=min(5, n_fechas)) if n_fechas >= 3 else None
+        if gkf is None:
+            print("    (Aviso: muy pocas fechas distintas para validación por fechas; se usa el split aleatorio)")
 
         resultados = {}
 
@@ -172,38 +298,31 @@ class ModeloPredictor:
         # MODELO 1: RANDOM FOREST
         # ==========================================
         print("\n Entrenando Random Forest...")
-        rf_model = RandomForestRegressor(n_estimators=100, random_state=42, max_depth=10)
-        rf_model.fit(X_train, y_train)
-        rf_pred = rf_model.predict(X_test)
-        rf_metricas = self.calcular_metricas(y_test, rf_pred)
-
-        # Guardar modelo RF
+        crear_rf = lambda: RandomForestRegressor(n_estimators=200, max_depth=6, random_state=42)
+        resultados['Random Forest'] = self._metricas_dobles(
+            crear_rf, X, y, X_train, y_train, X_test, y_test, fechas, gkf)
+        rf_model = crear_rf().fit(X, y)  # modelo final: TODOS los datos
         _guardar_atomico(self.archivo_modelo_rf, lambda f: pickle.dump(rf_model, f))
-
-        resultados['Random Forest'] = rf_metricas
-        print(f"    RMSE: {rf_metricas['rmse']}, Precisión: {rf_metricas['precision']}%")
+        print(f"    R2 honesto: {resultados['Random Forest']['r2']}, "
+              f"Precisión honesta: {resultados['Random Forest']['precision']}% "
+              f"(conocido: {resultados['Random Forest']['precision_conocido']}%)")
 
         # ==========================================
         # MODELO 2: XGBOOST
         # ==========================================
+        xgb_model = None
         if XGBOOST_DISPONIBLE:
             print("\n Entrenando XGBoost...")
-            xgb_model = xgb.XGBRegressor(
-                n_estimators=100,
-                max_depth=6,
-                learning_rate=0.1,
-                random_state=42,
-                objective='reg:squarederror'
-            )
-            xgb_model.fit(X_train, y_train)
-            xgb_pred = xgb_model.predict(X_test)
-            xgb_metricas = self.calcular_metricas(y_test, xgb_pred)
-
-            # Guardar modelo XGB
+            crear_xgb = lambda: xgb.XGBRegressor(
+                n_estimators=200, max_depth=4, learning_rate=0.1,
+                random_state=42, objective='reg:squarederror')
+            resultados['XGBoost'] = self._metricas_dobles(
+                crear_xgb, X, y, X_train, y_train, X_test, y_test, fechas, gkf)
+            xgb_model = crear_xgb().fit(X, y)  # modelo final: TODOS los datos
             _guardar_atomico(self.archivo_modelo_xgb, lambda f: pickle.dump(xgb_model, f))
-
-            resultados['XGBoost'] = xgb_metricas
-            print(f"    RMSE: {xgb_metricas['rmse']}, Precisión: {xgb_metricas['precision']}%")
+            print(f"    R2 honesto: {resultados['XGBoost']['r2']}, "
+                  f"Precisión honesta: {resultados['XGBoost']['precision']}% "
+                  f"(conocido: {resultados['XGBoost']['precision_conocido']}%)")
         else:
             resultados['XGBoost'] = {
                 'rmse': 0, 'mae': 0, 'r2': 0, 'precision': 0,
@@ -213,51 +332,35 @@ class ModeloPredictor:
         # ==========================================
         # MODELO 3: PROPHET (serie de tiempo)
         # ==========================================
-        # Prophet necesita la fecha real (columna 'ds'), no mes/dia_semana ya derivados -
-        # esos y es_fin_semana se excluyen de los regresores porque Prophet ya modela
-        # estacionalidad semanal/anual a partir de 'ds' internamente; agregarlos de nuevo
-        # sería redundante. Se usa el mismo X_train/X_test (mismas filas de prueba) que
-        # Random Forest y XGBoost para que las 3 métricas sean comparables entre sí.
+        # Prophet necesita la fecha real (columna 'ds'), no mes/dia_semana ya derivados - esos y
+        # es_fin_semana se excluyen de los regresores porque Prophet ya modela estacionalidad
+        # semanal/anual a partir de 'ds'. Además, un regresor constante (p. ej. temperatura cuando
+        # la tabla clima está vacía) rompe Prophet al estandarizarlo (divide por 0), así que solo se
+        # pasan regresores con variación real.
         prophet_model = None
-        if PROPHET_DISPONIBLE:
+        columnas_regresoras = [c for c in X.columns
+                               if c not in ('mes', 'dia_semana', 'es_fin_semana') and X[c].nunique() > 1]
+        if PROPHET_DISPONIBLE and fechas is not None:
             print("\n Entrenando Prophet...")
             try:
-                columnas_regresoras = [c for c in X_train.columns if c not in ('mes', 'dia_semana', 'es_fin_semana')]
-
-                df_prophet_train = pd.DataFrame({
-                    'ds': pd.to_datetime(df.loc[X_train.index, 'fecha']).values,
-                    'y': y_train.values
-                })
-                for c in columnas_regresoras:
-                    df_prophet_train[c] = X_train[c].values
-
-                prophet_model = Prophet()
-                for c in columnas_regresoras:
-                    prophet_model.add_regressor(c)
-                prophet_model.fit(df_prophet_train)
-
-                df_prophet_test = pd.DataFrame({'ds': pd.to_datetime(df.loc[X_test.index, 'fecha']).values})
-                for c in columnas_regresoras:
-                    df_prophet_test[c] = X_test[c].values
-
-                prophet_pred = prophet_model.predict(df_prophet_test)['yhat'].values
-                prophet_metricas = self.calcular_metricas(y_test, prophet_pred)
-
+                resultados['Prophet'] = self._metricas_prophet(df, X, y, columnas_regresoras, fechas, gkf)
+                prophet_model = self._ajustar_prophet(df, X.index, X, y, columnas_regresoras)  # final: todos
                 _guardar_atomico(self.archivo_modelo_prophet, lambda f: pickle.dump(
                     {'model': prophet_model, 'regresores': columnas_regresoras}, f))
-
-                resultados['Prophet'] = prophet_metricas
-                print(f"    RMSE: {prophet_metricas['rmse']}, Precisión: {prophet_metricas['precision']}%")
+                print(f"    R2 honesto: {resultados['Prophet']['r2']}, "
+                      f"Precisión honesta: {resultados['Prophet']['precision']}% "
+                      f"(conocido: {resultados['Prophet']['precision_conocido']}%)")
             except Exception as e:
                 print(f"    Error entrenando Prophet: {e}")
                 prophet_model = None
                 resultados['Prophet'] = {'rmse': 0, 'mae': 0, 'r2': 0, 'precision': 0, 'error': str(e)}
         else:
-            resultados['Prophet'] = {'rmse': 0, 'mae': 0, 'r2': 0, 'precision': 0, 'error': 'Prophet no instalado'}
+            resultados['Prophet'] = {'rmse': 0, 'mae': 0, 'r2': 0, 'precision': 0, 'error': 'Prophet no disponible'}
 
         # ==========================================
         # COMPARACIÓN Y SELECCIÓN DEL MEJOR
         # ==========================================
+        # Se elige por la PRECISIÓN HONESTA (la que generaliza a fechas nuevas), no por la inflada.
         mejor_modelo = 'Random Forest'
         for nombre in ('XGBoost', 'Prophet'):
             if resultados.get(nombre, {}).get('precision', 0) > resultados[mejor_modelo]['precision']:
@@ -307,20 +410,14 @@ class ModeloPredictor:
         }
 
     def predecir(self, datos_input):
-        """Genera predicción usando el mejor modelo, manejando columnas faltantes"""
+        """Genera predicción usando el mejor modelo, manejando columnas faltantes.
+
+        NOTA: el modelo ya no usa check-in / pernoctaciones / habitaciones ocupadas / tarifa (son
+        fuga de datos, ver COLUMNAS_FUGA); si llegan en datos_input, preprocesar() las descarta. La
+        predicción depende solo de la fecha (calendario), la temporada y el clima de esa fecha."""
         datos_input = dict(datos_input)  # no mutar el dict del llamador
         if not self.modelo_entrenado:
             self.cargar_modelo()
-
-        # 1. ESTIMAR VALORES FALTANTES (Para que no falle si el usuario no los pone)
-        if 'pernoctaciones' not in datos_input or datos_input.get('pernoctaciones') is None:
-            # Estimación: (Nacionales + Extranjeros) * 2.5 días promedio de estadía
-            datos_input['pernoctaciones'] = int((datos_input.get('checkin_nacionales', 0) + datos_input.get('checkin_extranjeros', 0)) * 2.5)
-
-        if 'habitaciones_ocupadas' not in datos_input or datos_input.get('habitaciones_ocupadas') is None:
-            # Estimación: Pernoctaciones / 2 (asumiendo 2 personas por habitación)
-            datos_input['habitaciones_ocupadas'] = int(datos_input['pernoctaciones']/2)
-
 
         modelo = self.modelos.get(self.nombre_modelo)
         if modelo is None:

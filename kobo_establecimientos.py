@@ -642,7 +642,7 @@ def procesar_establecimientos(df, get_db_connection):
         )
     if omitidos:
         advertencias.append(
-            f"{omitidos} fila(s) ya estaban cargadas (mismo envío de Kobo) y se omitieron - no se duplicaron."
+            f"{omitidos} fila(s) ya estaban cargadas (mismo envío) y se omitieron - no se duplicaron."
         )
 
     return {'insertados': insertados, 'errores': errores, 'omitidos': omitidos, 'detalles': detalles, 'advertencias': advertencias}
