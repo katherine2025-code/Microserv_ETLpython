@@ -1,9 +1,12 @@
 import pandas as pd
 import numpy as np
 from sklearn.ensemble import RandomForestRegressor
+from sklearn.linear_model import Ridge
+from sklearn.dummy import DummyRegressor
+from sklearn.pipeline import make_pipeline
 from sklearn.model_selection import train_test_split, GroupKFold, cross_val_predict
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
-from sklearn.preprocessing import LabelEncoder
+from sklearn.preprocessing import LabelEncoder, StandardScaler
 import pickle
 import os
 import re
@@ -64,25 +67,6 @@ except ImportError:
     XGBOOST_DISPONIBLE = False
     print("️ XGBoost no está instalado. Ejecuta: pip install xgboost")
 
-try:
-    # Prophet (vía cmdstanpy) busca su DLL de TBB con "where.exe tbb.dll" antes de cargar el
-    # modelo. Si no está en el PATH, "where.exe" imprime su error en el idioma de Windows (aquí,
-    # español, con tildes) y cmdstanpy intenta decodificarlo como UTF-8 y truena con
-    # UnicodeDecodeError - el síntoma visible termina siendo el engañoso "'Prophet' object has no
-    # attribute 'stan_backend'". Se evita el problema agregando esa carpeta al PATH de antemano,
-    # para que "where.exe" la encuentre y no llegue a imprimir ningún error.
-    import cmdstanpy
-    _tbb_dir = os.path.join(cmdstanpy.cmdstan_path(), 'stan', 'lib', 'stan_math', 'lib', 'tbb')
-    if os.path.isdir(_tbb_dir) and _tbb_dir not in os.environ.get('PATH', ''):
-        os.environ['PATH'] = _tbb_dir + os.pathsep + os.environ.get('PATH', '')
-
-    from prophet import Prophet
-    PROPHET_DISPONIBLE = True
-except Exception:
-    PROPHET_DISPONIBLE = False
-    print("️ Prophet no está disponible (revisa que cmdstan esté instalado: python -m cmdstanpy.install_cmdstan)")
-
-
 class ModeloPredictor:
     def __init__(self):
         self.modelos = {}  # Diccionario para guardar ambos modelos
@@ -93,7 +77,8 @@ class ModeloPredictor:
         os.makedirs(MODEL_DIR, exist_ok=True)
         self.archivo_modelo_rf = os.path.join(MODEL_DIR, "modelo_rf_ots.pkl")
         self.archivo_modelo_xgb = os.path.join(MODEL_DIR, "modelo_xgb_ots.pkl")
-        self.archivo_modelo_prophet = os.path.join(MODEL_DIR, "modelo_prophet_ots.pkl")
+        self.archivo_modelo_ridge = os.path.join(MODEL_DIR, "modelo_ridge_ots.pkl")
+        self.archivo_modelo_baseline = os.path.join(MODEL_DIR, "modelo_baseline_ots.pkl")
         self.archivo_ganador = os.path.join(MODEL_DIR, "modelo_ganador.json")
 
         # Un solo entrenamiento a la vez: el automático del arranque y el manual (POST /entrenar)
@@ -204,56 +189,8 @@ class ModeloPredictor:
             'r2_conocido': m_conocido['r2'],
         }
 
-    def _ajustar_prophet(self, df, idx, X, y, regresores):
-        """Ajusta un Prophet usando la fecha real como 'ds' y los regresores indicados. idx son las
-        etiquetas de índice (filas) a usar."""
-        df_tr = pd.DataFrame({
-            'ds': pd.to_datetime(df.loc[idx, 'fecha']).values,
-            'y': y.loc[idx].values,
-        })
-        for c in regresores:
-            df_tr[c] = X.loc[idx, c].values
-        m = Prophet()
-        for c in regresores:
-            m.add_regressor(c)
-        m.fit(df_tr)
-        return m
-
-    def _predecir_prophet(self, modelo_p, df, idx, X, regresores):
-        df_te = pd.DataFrame({'ds': pd.to_datetime(df.loc[idx, 'fecha']).values})
-        for c in regresores:
-            df_te[c] = X.loc[idx, c].values
-        return modelo_p.predict(df_te)['yhat'].values
-
-    def _metricas_prophet(self, df, X, y, regresores, fechas, gkf):
-        """Mismas dos lecturas (honesta + conocido) que _metricas_dobles, pero para Prophet, que
-        necesita la fecha real ('ds') en vez de mes/dia_semana derivados."""
-        etiquetas = X.index
-        pos = np.arange(len(y))
-        tr, te = train_test_split(pos, test_size=0.3, random_state=42)
-        m = self._ajustar_prophet(df, etiquetas[tr], X, y, regresores)
-        yhat_te = self._predecir_prophet(m, df, etiquetas[te], X, regresores)
-        m_conocido = self.calcular_metricas(y.iloc[te].values, yhat_te)
-
-        if gkf is not None:
-            y_cv = np.empty(len(y)); y_cv[:] = np.nan
-            for tr2, te2 in gkf.split(X, y, fechas):
-                mm = self._ajustar_prophet(df, etiquetas[tr2], X, y, regresores)
-                y_cv[te2] = self._predecir_prophet(mm, df, etiquetas[te2], X, regresores)
-            m_honesto = self.calcular_metricas(y.values, y_cv)
-        else:
-            m_honesto = m_conocido
-
-        return {
-            **m_honesto,
-            'precision_conocido': m_conocido['precision'],
-            'rmse_conocido': m_conocido['rmse'],
-            'mae_conocido': m_conocido['mae'],
-            'r2_conocido': m_conocido['r2'],
-        }
-
     def entrenar(self, df):
-        """Entrena los 3 algoritmos (Random Forest, XGBoost, Prophet) y los compara.
+        """Entrena 3 modelos (Ridge, Random Forest, XGBoost) y los compara contra un baseline.
 
         CORRECCIÓN (nov-2026): el modelo ya NO usa check-in / pernoctaciones / habitaciones
         ocupadas / tarifa como predictoras (ver COLUMNAS_FUGA): esas variables SON la ocupación del
@@ -330,46 +267,52 @@ class ModeloPredictor:
             }
 
         # ==========================================
-        # MODELO 3: PROPHET (serie de tiempo)
+        # MODELO 3: RIDGE (Regresión Lineal regularizada)
         # ==========================================
-        # Prophet necesita la fecha real (columna 'ds'), no mes/dia_semana ya derivados - esos y
-        # es_fin_semana se excluyen de los regresores porque Prophet ya modela estacionalidad
-        # semanal/anual a partir de 'ds'. Además, un regresor constante (p. ej. temperatura cuando
-        # la tabla clima está vacía) rompe Prophet al estandarizarlo (divide por 0), así que solo se
-        # pasan regresores con variación real.
-        prophet_model = None
-        columnas_regresoras = [c for c in X.columns
-                               if c not in ('mes', 'dia_semana', 'es_fin_semana') and X[c].nunique() > 1]
-        if PROPHET_DISPONIBLE and fechas is not None:
-            print("\n Entrenando Prophet...")
-            try:
-                resultados['Prophet'] = self._metricas_prophet(df, X, y, columnas_regresoras, fechas, gkf)
-                prophet_model = self._ajustar_prophet(df, X.index, X, y, columnas_regresoras)  # final: todos
-                _guardar_atomico(self.archivo_modelo_prophet, lambda f: pickle.dump(
-                    {'model': prophet_model, 'regresores': columnas_regresoras}, f))
-                print(f"    R2 honesto: {resultados['Prophet']['r2']}, "
-                      f"Precisión honesta: {resultados['Prophet']['precision']}% "
-                      f"(conocido: {resultados['Prophet']['precision_conocido']}%)")
-            except Exception as e:
-                print(f"    Error entrenando Prophet: {e}")
-                prophet_model = None
-                resultados['Prophet'] = {'rmse': 0, 'mae': 0, 'r2': 0, 'precision': 0, 'error': str(e)}
-        else:
-            resultados['Prophet'] = {'rmse': 0, 'mae': 0, 'r2': 0, 'precision': 0, 'error': 'Prophet no disponible'}
+        # Familia distinta a los árboles (RF/XGBoost): da contraste real en la comparación y se
+        # porta bien con pocos datos. Se estandarizan las variables (StandardScaler) para que la
+        # regularización trate a todas por igual sin importar su escala (mes 1-12 vs es_fin_semana 0/1).
+        print("\n Entrenando Ridge (Regresión Lineal)...")
+        crear_ridge = lambda: make_pipeline(StandardScaler(), Ridge(alpha=1.0))
+        resultados['Ridge'] = self._metricas_dobles(
+            crear_ridge, X, y, X_train, y_train, X_test, y_test, fechas, gkf)
+        ridge_model = crear_ridge().fit(X, y)  # modelo final: TODOS los datos
+        _guardar_atomico(self.archivo_modelo_ridge, lambda f: pickle.dump(ridge_model, f))
+        print(f"    R2 honesto: {resultados['Ridge']['r2']}, "
+              f"Precisión honesta: {resultados['Ridge']['precision']}% "
+              f"(conocido: {resultados['Ridge']['precision_conocido']}%)")
+
+        # ==========================================
+        # REFERENCIA: BASELINE INGENUO (predice el promedio)
+        # ==========================================
+        # NO es un modelo de ML: predice SIEMPRE la ocupación promedio del entrenamiento, ignorando
+        # las variables. Es el "piso" a vencer: si un modelo real no le gana, no está aportando nada.
+        # Se calcula y reporta, pero NUNCA se elige como ganador para predecir.
+        print("\n Calculando Baseline (promedio)...")
+        crear_baseline = lambda: DummyRegressor(strategy='mean')
+        resultados['Baseline'] = self._metricas_dobles(
+            crear_baseline, X, y, X_train, y_train, X_test, y_test, fechas, gkf)
+        baseline_model = crear_baseline().fit(X, y)  # referencia final: promedio de TODOS los datos
+        _guardar_atomico(self.archivo_modelo_baseline, lambda f: pickle.dump(baseline_model, f))
+        print(f"    R2 honesto: {resultados['Baseline']['r2']}, "
+              f"Precisión honesta: {resultados['Baseline']['precision']}% "
+              f"(conocido: {resultados['Baseline']['precision_conocido']}%)")
 
         # ==========================================
         # COMPARACIÓN Y SELECCIÓN DEL MEJOR
         # ==========================================
         # Se elige por la PRECISIÓN HONESTA (la que generaliza a fechas nuevas), no por la inflada.
+        # El Baseline NO entra en la selección: es solo la referencia a vencer.
         mejor_modelo = 'Random Forest'
-        for nombre in ('XGBoost', 'Prophet'):
+        for nombre in ('XGBoost', 'Ridge'):
             if resultados.get(nombre, {}).get('precision', 0) > resultados[mejor_modelo]['precision']:
                 mejor_modelo = nombre
 
         self.modelos = {
+            'Baseline': baseline_model,
+            'Ridge': ridge_model,
             'Random Forest': rf_model,
             'XGBoost': xgb_model if XGBOOST_DISPONIBLE else None,
-            'Prophet': {'model': prophet_model, 'regresores': columnas_regresoras} if prophet_model else None
         }
         self.metricas = resultados
         self.nombre_modelo = mejor_modelo
@@ -393,19 +336,22 @@ class ModeloPredictor:
 
     def generar_comparacion(self):
         """Genera un resumen comparativo"""
+        baseline = self.metricas.get('Baseline', {})
+        ridge = self.metricas.get('Ridge', {})
         rf = self.metricas.get('Random Forest', {})
         xgb = self.metricas.get('XGBoost', {})
-        prophet = self.metricas.get('Prophet', {})
 
-        candidatos = {'Random Forest': rf, 'XGBoost': xgb, 'Prophet': prophet}
+        # El ganador se elige SOLO entre los modelos reales (el baseline es la referencia a vencer).
+        candidatos = {'Ridge': ridge, 'Random Forest': rf, 'XGBoost': xgb}
         ganador = max(candidatos, key=lambda n: candidatos[n].get('precision', 0))
         precisiones = [c.get('precision', 0) for c in candidatos.values()]
 
         return {
             'ganador': ganador,
+            'baseline': baseline,
+            'ridge': ridge,
             'random_forest': rf,
             'xgboost': xgb,
-            'prophet': prophet,
             'diferencia_precision': round(max(precisiones) - min(precisiones), 2)
         }
 
@@ -423,24 +369,8 @@ class ModeloPredictor:
         if modelo is None:
             raise ValueError("No hay modelo disponible para predecir")
 
-        # Prophet se guarda como {'model', 'regresores'} en vez de un estimador de sklearn
-        # directo (ver entrenar()): necesita la fecha real como 'ds', no las columnas
-        # mes/dia_semana ya derivadas, así que se maneja aparte del resto.
-        if self.nombre_modelo == 'Prophet':
-            fecha = datos_input.get('fecha_objetivo') or datos_input.get('fecha')
-            if not fecha:
-                raise ValueError("Prophet necesita 'fecha_objetivo' para predecir")
-
-            df_input = pd.DataFrame([datos_input])
-            df_input = self.preprocesar(df_input)
-
-            df_prophet = pd.DataFrame({'ds': pd.to_datetime([fecha])})
-            for c in modelo['regresores']:
-                df_prophet[c] = df_input[c].values if c in df_input.columns else 0
-
-            prediccion = modelo['model'].predict(df_prophet)['yhat'].iloc[0]
-            return max(0, min(100, prediccion))
-
+        # Todos los modelos en uso (Ridge, Random Forest, XGBoost) son estimadores de sklearn que
+        # predicen a partir de la matriz de variables ya preprocesada, así que comparten este camino.
         df_input = pd.DataFrame([datos_input])
         df_input = self.preprocesar(df_input)
 
@@ -467,9 +397,13 @@ class ModeloPredictor:
             with open(self.archivo_modelo_xgb, 'rb') as f:
                 self.modelos['XGBoost'] = pickle.load(f)
 
-        if os.path.exists(self.archivo_modelo_prophet):
-            with open(self.archivo_modelo_prophet, 'rb') as f:
-                self.modelos['Prophet'] = pickle.load(f)
+        if os.path.exists(self.archivo_modelo_ridge):
+            with open(self.archivo_modelo_ridge, 'rb') as f:
+                self.modelos['Ridge'] = pickle.load(f)
+
+        if os.path.exists(self.archivo_modelo_baseline):
+            with open(self.archivo_modelo_baseline, 'rb') as f:
+                self.modelos['Baseline'] = pickle.load(f)
 
         if os.path.exists(self.archivo_ganador):
             with open(self.archivo_ganador, 'r', encoding='utf-8') as f:

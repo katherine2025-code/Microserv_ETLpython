@@ -3,25 +3,14 @@
 # más forma de fallar).
 FROM python:3.12-slim
 
-# build-essential (gcc/g++/make): Prophet corre sobre CmdStan, que se compila en C++. Se instala
-# aquí y NO se quita después: si el modelo llega a recompilarse en tiempo de ejecución (primer
-# uso de Prophet tras un cambio), necesita el compilador disponible en la imagen final.
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential \
-    && rm -rf /var/lib/apt/lists/*
+# Nota: ya NO se instala build-essential ni CmdStan. Eran necesarios SOLO para Prophet, que se
+# retiró del proyecto (los modelos ahora son Ridge, Random Forest y XGBoost + un baseline, todos
+# con wheels precompilados). La imagen queda más liviana y con menos piezas que puedan fallar.
 
 WORKDIR /app
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt \
-    # Prophet instala numpy 2.x como dependencia; scikit-learn/xgboost de este proyecto NO son
-    # compatibles con numpy 2.x (ver nota en requirements.txt) - se refuerza el pin aquí también,
-    # por si el resolver de pip llegara a subirlo igual.
-    && pip install --no-cache-dir "numpy==1.26.3"
-
-# Compila CmdStan (el motor de Prophet) UNA SOLA VEZ, aquí en el build de la imagen. Sin esto, el
-# primer entrenamiento en el contenedor tardaría varios minutos compilándolo en caliente.
-RUN python -m cmdstanpy.install_cmdstan --verbose
+RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 

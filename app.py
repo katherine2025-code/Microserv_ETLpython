@@ -141,7 +141,7 @@ async def health():
         "estado_modelo": modelo.estado(),
         "modelo_entrenado": modelo.modelo_entrenado,
         "error_entrenamiento": modelo.error_entrenamiento,
-        # modelo.metricas es {'Random Forest': {...}, 'XGBoost': {...}, 'Prophet': {...}}, no un
+        # modelo.metricas es {'Baseline': {...}, 'Ridge': {...}, 'Random Forest': {...}, 'XGBoost': {...}}, no un
         # dict plano con 'precision' - hay que ir a las métricas del modelo GANADOR (nombre_modelo).
         "precision": float(modelo.metricas.get(modelo.nombre_modelo, {}).get('precision', 0)) if modelo.modelo_entrenado else None,
         "fecha_entrenamiento": modelo.fecha_entrenamiento,
@@ -549,7 +549,7 @@ def entrenar_desde_bd():
         raise EntrenamientoEnCurso()
     modelo.entrenando = True
     try:
-        print("\n🔄 Iniciando entrenamiento comparativo (RF vs XGBoost vs Prophet)...")
+        print("\n🔄 Iniciando entrenamiento comparativo (Ridge vs RF vs XGBoost, con baseline)...")
         df = obtener_dataset_ml()
 
         if df is None or len(df) == 0:
@@ -684,7 +684,7 @@ async def predecir_ocupacion(request: PrediccionRequest):
         prediccion_val = modelo.predecir(datos)
         prediccion_float = float(max(0, min(100, prediccion_val)))
         
-        # modelo.metricas es {'Random Forest': {...}, 'XGBoost': {...}, 'Prophet': {...}}, no un
+        # modelo.metricas es {'Baseline': {...}, 'Ridge': {...}, 'Random Forest': {...}, 'XGBoost': {...}}, no un
         # dict plano - hay que ir a las métricas del modelo que realmente se está usando.
         metricas_modelo = modelo.metricas.get(modelo.nombre_modelo, {})
         error_estimado = float(metricas_modelo.get('rmse', 5))
