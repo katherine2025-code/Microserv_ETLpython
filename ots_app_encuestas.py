@@ -13,7 +13,10 @@ Columnas:
 
   - id_respuesta: id en la tabla `respuestas_encuestas`. Si viene, la carga es
     IDEMPOTENTE: una respuesta ya cargada (fecha_etl no nula) se omite, así
-    subir dos veces el mismo archivo no duplica datos.
+    subir dos veces el mismo archivo no duplica datos. Además se guarda en
+    `encuestas_turisticas.uuid_kobo` como 'app-<id_respuesta>' para TRAZABILIDAD:
+    así cada fila limpia/exportada se puede rastrear hasta su registro crudo
+    (antes la app no dejaba ningún identificador y ese rastro se perdía).
   - tipo_encuesta: 'turista' -> encuestas_turisticas | 'hotel' -> ocupacion_hotelera.
 
 El administrador puede editar las preguntas y respuestas. Por eso el parser es
@@ -296,13 +299,18 @@ CAMPOS_TURISTA_NUEVOS = ([p['columna'] for p in PREGUNTAS_APP]
 
 
 def _sql_turista(columnas_bd):
-    """Arma el INSERT de turista incluyendo las columnas nuevas que existan en la BD."""
+    """Arma el INSERT de turista incluyendo las columnas nuevas que existan en la BD.
+
+    Si existe la columna `uuid_kobo`, se incluye para guardar ahí el id de origen de la app
+    ('app-<id_respuesta>'), igual que el camino Kobo guarda su `_uuid`. Así cada fila queda
+    rastreable hasta su registro crudo (antes se perdía: la app no dejaba identificador)."""
     nuevos = [c for c in CAMPOS_TURISTA_NUEVOS if c in columnas_bd]
-    campos = ['fecha_encuesta'] + CAMPOS_TURISTA_BASE + nuevos
+    con_uuid = 'uuid_kobo' in columnas_bd
+    campos = ['fecha_encuesta'] + CAMPOS_TURISTA_BASE + nuevos + (['uuid_kobo'] if con_uuid else [])
     marcas = ', '.join(['%s'] * len(campos))
     sql = (f"INSERT INTO encuestas_turisticas ({', '.join(campos)}, fecha_registro) "
            f"VALUES ({marcas}, NOW())")
-    return sql, nuevos
+    return sql, nuevos, con_uuid
 
 
 # ==========================================================================
@@ -474,9 +482,10 @@ def procesar_encuestas_app(df, tipo_encuesta, get_db_connection):
                 )
 
         sql_turista = campos_turista_nuevos = None
+        con_uuid_turista = False
         if tipo_encuesta == 'turista':
             columnas_turisticas = columnas_de(cursor, 'encuestas_turisticas')
-            sql_turista, campos_turista_nuevos = _sql_turista(columnas_turisticas)
+            sql_turista, campos_turista_nuevos, con_uuid_turista = _sql_turista(columnas_turisticas)
             faltan_cols = [c for c in CAMPOS_TURISTA_NUEVOS if c not in columnas_turisticas]
             if faltan_cols:
                 advertencias.append(
@@ -523,6 +532,10 @@ def procesar_encuestas_app(df, tipo_encuesta, get_db_connection):
                     r = _extraer_turista(row, cont)
                     valores = [fecha] + [r[c] for c in CAMPOS_TURISTA_BASE] \
                               + [r[c] for c in campos_turista_nuevos]
+                    # Trazabilidad: guarda el id de origen de la app en uuid_kobo ('app-<id>'),
+                    # para poder rastrear cada fila limpia hasta su registro crudo.
+                    if con_uuid_turista:
+                        valores.append(f"app-{id_resp}" if id_resp is not None else None)
                     cursor.execute(sql_turista, valores)
                 else:
                     r, avisos = _extraer_hotel(row, fecha)
