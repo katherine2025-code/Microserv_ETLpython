@@ -25,6 +25,7 @@ avisa; si una respuesta ya no coincide con las opciones conocidas se conserva
 el texto tal cual (o 0 en campos numéricos) y se cuenta en las advertencias.
 """
 import re
+import json
 from datetime import timedelta
 
 import pandas as pd
@@ -110,6 +111,17 @@ def _texto(row, campo):
         return None
     valor = row[campo]
     return _norm(valor) if _valido(valor) else None
+
+
+def _lugares_app(texto):
+    """La app trae los lugares visitados como 'A | B | C' (selección múltiple). Se devuelven
+    como lista (para guardar en la columna JSON `lugares_visitados`). NO se filtran contra una
+    lista fija: las opciones de la app ya son nombres limpios, y filtrar perdía sitios válidos
+    (ej. 'REMACOPSE', 'Otro'). Antes la app no poblaba este campo y salía vacío en el export."""
+    if not texto:
+        return []
+    partes = [p.strip() for p in str(texto).split('|')]
+    return [p for p in partes if p and 'prefiero no responder' not in p.lower()]
 
 
 def _entero(row, campo):
@@ -284,6 +296,16 @@ def _extraer_turista(row, cont):
     for campo in CAMPOS_NUEVOS_ESCALA:
         registro[campo] = escala(campo)
 
+    # Campos que antes se perdían. Se insertan solo si la columna existe en la BD (ver _sql_turista):
+    #  - lugares_visitados: no se poblaba y salía vacío en el export (el crudo sí lo trae).
+    #  - cedula_encuestador: quién levantó la encuesta (trazabilidad; requiere migración de columna).
+    #  - probabilidad_recomendar: antes SOLO se guardaba mal-etiquetado como probabilidad_retorno;
+    #    ahora también bajo su nombre correcto (probabilidad_retorno se mantiene por compatibilidad
+    #    con el modelo/export; requiere migración de columna).
+    registro['lugares_visitados'] = json.dumps(_lugares_app(_texto(row, 'lugares_visitados')), ensure_ascii=False)
+    registro['cedula_encuestador'] = _texto(row, 'cedula_encuestador')
+    registro['probabilidad_recomendar'] = escala('probabilidad_recomendar')
+
     return registro
 
 
@@ -299,18 +321,27 @@ CAMPOS_TURISTA_NUEVOS = ([p['columna'] for p in PREGUNTAS_APP]
 
 
 def _sql_turista(columnas_bd):
-    """Arma el INSERT de turista incluyendo las columnas nuevas que existan en la BD.
+    """Arma el INSERT de turista incluyendo las columnas que existan en la BD.
 
-    Si existe la columna `uuid_kobo`, se incluye para guardar ahí el id de origen de la app
-    ('app-<id_respuesta>'), igual que el camino Kobo guarda su `_uuid`. Así cada fila queda
-    rastreable hasta su registro crudo (antes se perdía: la app no dejaba identificador)."""
+    Columnas opcionales que se incluyen SOLO si ya existen (para no romper si falta la migración):
+      - lugares_visitados: lista JSON de sitios que la app sí trae (antes salía vacío).
+      - cedula_encuestador: quién levantó la encuesta (trazabilidad).
+      - probabilidad_recomendar: nombre correcto de la pregunta (antes solo iba en probabilidad_retorno).
+      - uuid_kobo: id de origen de la app ('app-<id_respuesta>'), para rastrear hasta el crudo.
+    `flags` indica cuáles entraron, para que el llamador agregue sus valores en el MISMO orden."""
     nuevos = [c for c in CAMPOS_TURISTA_NUEVOS if c in columnas_bd]
-    con_uuid = 'uuid_kobo' in columnas_bd
-    campos = ['fecha_encuesta'] + CAMPOS_TURISTA_BASE + nuevos + (['uuid_kobo'] if con_uuid else [])
+    flags = {
+        'lugares_visitados': 'lugares_visitados' in columnas_bd,
+        'cedula_encuestador': 'cedula_encuestador' in columnas_bd,
+        'probabilidad_recomendar': 'probabilidad_recomendar' in columnas_bd,
+        'uuid_kobo': 'uuid_kobo' in columnas_bd,
+    }
+    opcionales = [c for c in ('lugares_visitados', 'cedula_encuestador', 'probabilidad_recomendar', 'uuid_kobo') if flags[c]]
+    campos = ['fecha_encuesta'] + CAMPOS_TURISTA_BASE + nuevos + opcionales
     marcas = ', '.join(['%s'] * len(campos))
     sql = (f"INSERT INTO encuestas_turisticas ({', '.join(campos)}, fecha_registro) "
            f"VALUES ({marcas}, NOW())")
-    return sql, nuevos, con_uuid
+    return sql, nuevos, flags
 
 
 # ==========================================================================
@@ -482,10 +513,10 @@ def procesar_encuestas_app(df, tipo_encuesta, get_db_connection):
                 )
 
         sql_turista = campos_turista_nuevos = None
-        con_uuid_turista = False
+        flags_turista = {}
         if tipo_encuesta == 'turista':
             columnas_turisticas = columnas_de(cursor, 'encuestas_turisticas')
-            sql_turista, campos_turista_nuevos, con_uuid_turista = _sql_turista(columnas_turisticas)
+            sql_turista, campos_turista_nuevos, flags_turista = _sql_turista(columnas_turisticas)
             faltan_cols = [c for c in CAMPOS_TURISTA_NUEVOS if c not in columnas_turisticas]
             if faltan_cols:
                 advertencias.append(
@@ -532,9 +563,16 @@ def procesar_encuestas_app(df, tipo_encuesta, get_db_connection):
                     r = _extraer_turista(row, cont)
                     valores = [fecha] + [r[c] for c in CAMPOS_TURISTA_BASE] \
                               + [r[c] for c in campos_turista_nuevos]
-                    # Trazabilidad: guarda el id de origen de la app en uuid_kobo ('app-<id>'),
-                    # para poder rastrear cada fila limpia hasta su registro crudo.
-                    if con_uuid_turista:
+                    # Columnas opcionales: MISMO orden que en _sql_turista (lugares, cédula,
+                    # probabilidad_recomendar, uuid_kobo). uuid_kobo guarda el id de origen de la
+                    # app ('app-<id>') para rastrear cada fila limpia hasta su registro crudo.
+                    if flags_turista.get('lugares_visitados'):
+                        valores.append(r.get('lugares_visitados'))
+                    if flags_turista.get('cedula_encuestador'):
+                        valores.append(r.get('cedula_encuestador'))
+                    if flags_turista.get('probabilidad_recomendar'):
+                        valores.append(r.get('probabilidad_recomendar'))
+                    if flags_turista.get('uuid_kobo'):
                         valores.append(f"app-{id_resp}" if id_resp is not None else None)
                     cursor.execute(sql_turista, valores)
                 else:
